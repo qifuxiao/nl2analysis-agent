@@ -31,3 +31,8 @@ Body:
 
 # 开发环境运行命令
 `poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000`
+
+# 测试命令：
+`curl -N -X POST http://localhost:8000/nl2analysis/stream \
+     -H "Content-Type: application/json" \
+     -d '{"query": "查询学生专业分布", "user_id": "alex", "session_id": "123"}'`
