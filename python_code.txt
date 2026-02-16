@@ -1,0 +1,1457 @@
+========================================
+  Python 项目代码收集报告
+========================================
+源目录: /home/alexqi/develop/nl2analysis-agent
+收集时间: 2026-02-16 05:52:30
+排除: .env*, __pycache__, .git, .venv, *.pyc, *.pyo, *.log
+========================================
+
+
+====================================================================
+文件: .vscode/launch.json
+大小: 1457 bytes
+====================================================================
+
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+      "name": "FastAPI: Debug Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "FastAPI: Uvicorn Debug",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000"
+        
+      ],
+      "jinja": true,
+      "justMyCode": true,
+      "env": {
+        "PYTHONBREAKPOINT": "ipdb.set_trace",
+        "DEBUG": "True"
+      }
+    },
+    {
+      "name": "FastAPI: Attach to Process",
+      "type": "python",
+      "request": "attach",
+      "processId": "${command:pickProcess}",
+      "justMyCode": true
+    },
+    {
+      "name": "FastAPI: Debug with Poetry",
+      "type": "python",
+      "request": "launch",
+      "module": "uvicorn",
+      "args": [
+        "app.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload"
+      ],
+      "python": "${command:python.interpreterPath}",
+      "justMyCode": true,
+      "env": {
+        "PYTHONBREAKPOINT": "pdb.set_trace"
+      }
+    }
+  ]
+}
+--- 文件结束: .vscode/launch.json ---
+
+
+====================================================================
+文件: Dockerfile
+大小: 263 bytes
+====================================================================
+
+FROM python:3.11-slim
+WORKDIR /app
+
+RUN pip install poetry
+COPY pyproject.toml poetry.lock /app/
+RUN poetry config virtualenvs.create false && poetry install --no-dev
+
+COPY . /app
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+
+--- 文件结束: Dockerfile ---
+
+
+====================================================================
+文件: README.md
+大小: 598 bytes
+====================================================================
+
+<!--
+ * @Author: qifuxiao 867225266@qq.com
+ * @Date: 2026-02-13 09:16:26
+ * @FilePath: /nl2analysis-agent/README.md
+-->
+# LangGraph
+# NL2Analysis Agent Platform
+
+企业级自然语言 BI Agent 后端服务
+
+## 功能
+- 多用户隔离
+- 会话级 Memory
+- NL → SQL → 数据分析 → 可视化
+- 多数据库支持
+- Docker 一键部署
+
+## 启动
+cp .env.example .env
+docker compose up -d --build
+
+## 接口
+POST /v1/agent/chat
+
+Body:
+{
+  "session_id": "xxx",
+  "query": "最近7天订单金额趋势"
+}
+
+
+# 开发环境运行命令
+`poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000`
+--- 文件结束: README.md ---
+
+
+====================================================================
+文件: app/agent/graph.py
+大小: 1124 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:15:10
+FilePath: /alexqi/develop/nl2analysis-agent/app/agent/graph.py
+'''
+from langgraph.graph import StateGraph
+from app.agent.state import AgentState
+from app.agent.nodes import (
+    pre_memory_node, nl2sql_node, db_query_node,
+    analysis_node, chart_node, clarification_node, post_memory_node
+)
+
+graph = StateGraph(AgentState)
+
+graph.add_node("pre_memory", pre_memory_node)
+graph.add_node("nl2sql", nl2sql_node)
+graph.add_node("query_db", db_query_node)
+graph.add_node("analysis", analysis_node)
+# graph.add_node("chart", chart_node)
+graph.add_node("clarify", clarification_node)
+graph.add_node("post_memory", post_memory_node)
+
+graph.set_entry_point("pre_memory")
+graph.add_edge("pre_memory", "nl2sql")
+graph.add_edge("nl2sql", "query_db")
+
+def router(state):
+    return "clarify" if state.get("error") else "analysis"
+
+graph.add_conditional_edges("query_db", router, {"clarify": "clarify", "analysis": "analysis"})
+# graph.add_edge("analysis", "chart")
+# graph.add_edge("chart", "post_memory")
+graph.add_edge("clarify", "nl2sql")
+
+app_graph = graph.compile()
+
+--- 文件结束: app/agent/graph.py ---
+
+
+====================================================================
+文件: app/agent/nodes.py
+大小: 3655 bytes
+====================================================================
+
+from app.llm.client import get_llm
+from app.tools.db_tool import run_sql
+from app.analysis.analyzer import analyze_data
+from app.core.schema_index import schema_index
+from app.memory.backend import load_session, save_session
+from app.analysis.chart import generate_chart_html
+from app.memory.models import ChatMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+import asyncio
+import re
+
+llm = get_llm()
+
+def extract_pure_sql(text: str) -> str:
+    text = re.sub(r"```sql\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```\n?", "", text)
+    if ";" in text:
+        text = text.split(";")[0] + ";"
+    return text.strip()
+
+async def pre_memory_node(state):
+    # 异步包装同步 IO
+    loop = asyncio.get_event_loop()
+    memory = await loop.run_in_executor(None, load_session, state["user_id"], state["session_id"])
+    return {"history": [m.__dict__ for m in memory.messages]}
+
+async def nl2sql_node(state):
+    tables = schema_index.retrieve(state["query"], k=5)
+    tables_schema = "\n".join(tables)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "你是一个专业的 SQL 生成专家。请根据表结构生成 SELECT 语句。严禁 Markdown 标签。\n\n【表结构】\n{schema}"),
+        ("human", "{question}")
+    ])
+
+    sql_chain = prompt | llm | StrOutputParser()
+    # 使用 ainvoke 异步调用
+    raw_sql = await sql_chain.ainvoke({
+        "schema": tables_schema,
+        "question": state["query"]
+    })
+
+    clean_sql = extract_pure_sql(raw_sql)
+    print(f"--- Generated SQL ---\n{clean_sql}\n---------------------")
+    return {"sql": clean_sql}
+
+async def db_query_node(state):
+    try:
+        # 使用 run_in_executor 避免 SQL 查询阻塞事件循环
+        loop = asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, run_sql, state["sql"])
+        if not data:
+            return {"error": "查询结果为空", "raw_data": []}
+        return {"raw_data": data}
+    except Exception as e:
+        return {"error": str(e)}
+
+async def analysis_node(state):
+    # analyze_data 已经是异步的了
+    result = await analyze_data(state["raw_data"], state["query"])
+    return {"analysis": result}
+
+async def clarification_node(state):
+    prompt = f"用户问题：{state['query']}\n错误信息：{state.get('error')}\n请生成一句澄清问题。"
+    # 使用 ainvoke
+    res = await llm.ainvoke(prompt)
+    question = res.content.strip()
+    return {"analysis": {"need_clarification": True, "question": question}}
+
+async def post_memory_node(state):
+    loop = asyncio.get_event_loop()
+    def _save():
+        memory = load_session(state["user_id"], state["session_id"])
+        memory.messages.append(ChatMessage(role="user", content=state["query"]))
+        memory.messages.append(ChatMessage(role="assistant", content=state["analysis"].get("summary", "")))
+        save_session(memory)
+    await loop.run_in_executor(None, _save)
+    return {}
+async def chart_node(state):
+    """
+    异步图表生成节点
+    """
+    # 检查是否有数据可供绘图
+    if not state.get("raw_data"):
+        return {"analysis": state.get("analysis", {})}
+
+    # 将同步的图表生成逻辑放入线程池执行，防止阻塞 SSE 流
+    loop = asyncio.get_event_loop()
+    html = await loop.run_in_executor(
+        None, 
+        generate_chart_html, 
+        state["raw_data"], 
+        state["query"]
+    )
+    
+    # 更新状态中的 analysis 字典
+    current_analysis = state.get("analysis", {})
+    current_analysis["chart_html"] = html
+    
+    return {"analysis": current_analysis}
+--- 文件结束: app/agent/nodes.py ---
+
+
+====================================================================
+文件: app/agent/state.py
+大小: 415 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:17:48
+FilePath: /alexqi/develop/nl2analysis-agent/app/agent/state.py
+'''
+# app/agent/state.py
+from typing import TypedDict, Optional, List
+
+class AgentState(TypedDict):
+    user_id: str
+    session_id: str
+    query: str
+    history: List[dict]
+    sql: Optional[str]
+    raw_data: Optional[list[dict]]
+    analysis: Optional[dict]
+    error: Optional[str]
+
+--- 文件结束: app/agent/state.py ---
+
+
+====================================================================
+文件: app/analysis/analyzer.py
+大小: 931 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:32:08
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-16 05:42:36
+FilePath: /nl2analysis-agent/app/analysis/analyzer.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+import pandas as pd
+from app.llm.client import get_llm
+
+llm = get_llm()
+
+async def analyze_data(data: list[dict], query: str) -> dict:
+    df = pd.DataFrame(data)
+    if df.empty:
+        return {"summary": "本次查询无数据。"}
+
+    stats = df.describe(include="all").to_dict()
+    prompt = f"用户问题：{query}\n统计信息：{stats}\n请输出中文业务结论，并给出1-2条运营建议。"
+    
+    # 确保是 ainvoke
+    response = await llm.ainvoke(prompt) 
+    summary = response.content.strip()
+    return {"summary": summary, "stats": stats}
+--- 文件结束: app/analysis/analyzer.py ---
+
+
+====================================================================
+文件: app/analysis/chart.py
+大小: 470 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:31:47
+FilePath: /alexqi/develop/nl2analysis-agent/app/analysis/chart.py
+'''
+import pandas as pd
+import plotly.express as px
+
+def generate_chart_html(data: list[dict], title: str) -> str:
+    df = pd.DataFrame(data)
+    if df.empty or len(df.columns) < 2:
+        return "<p>暂无可视化数据</p>"
+
+    x, y = df.columns[:2]
+    fig = px.bar(df, x=x, y=y, title=title)
+    return fig.to_html(full_html=False)
+
+--- 文件结束: app/analysis/chart.py ---
+
+
+====================================================================
+文件: app/api/chat.py
+大小: 663 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:15:46
+FilePath: /alexqi/develop/nl2analysis-agent/app/api/chat.py
+'''
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel
+from app.agent.graph import app_graph
+
+router = APIRouter()
+
+class ChatReq(BaseModel):
+    session_id: str
+    query: str
+
+def get_current_user():
+    return "user_001"  # TODO: 接 JWT / API Key
+
+@router.post("/v1/agent/chat")
+def chat(req: ChatReq, user_id: str = Depends(get_current_user)):
+    state = {
+        "user_id": user_id,
+        "session_id": req.session_id,
+        "query": req.query,
+        "history": []
+    }
+    return app_graph.invoke(state)
+
+--- 文件结束: app/api/chat.py ---
+
+
+====================================================================
+文件: app/api/nl2analysis.py
+大小: 2741 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:31:11
+FilePath: /alexqi/develop/nl2analysis-agent/app/api/nl2analysis.py
+'''
+# app/api/nl2analysis.py
+import json
+import asyncio
+import math
+from fastapi import APIRouter, Request
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from fastapi.encoders import jsonable_encoder
+from app.agent.graph import app_graph
+from app.tools.db_tool import clean_nans
+router = APIRouter()
+
+class QueryReq(BaseModel):
+    query: str
+    user_id: str = "default_user"     # 添加默认值，防止旧客户端报错
+    session_id: str = "default_session"
+
+@router.post("/nl2analysis")
+def nl2analysis(req: QueryReq):
+    # 将接收到的参数全部塞进 Graph 的初始输入中
+    result= app_graph.invoke({
+        "query": req.query, 
+        "history": [],
+        "user_id": req.user_id,
+        "session_id": req.session_id
+    })
+
+    return clean_nans(jsonable_encoder(result))
+def safe_json_dumps(obj):
+    """处理 NaN/Inf 并序列化"""
+    def _clean(o):
+        if isinstance(o, float):
+            return None if math.isnan(o) or math.isinf(o) else o
+        if isinstance(o, dict): return {k: _clean(v) for k, v in o.items()}
+        if isinstance(o, list): return [_clean(x) for x in o]
+        return o
+    return json.dumps(_clean(jsonable_encoder(obj)), ensure_ascii=False)
+
+@router.post("/nl2analysis/stream")
+async def nl2analysis_stream(req: QueryReq):
+    async def event_generator():
+        inputs = {"query": req.query, "user_id": req.user_id, "session_id": req.session_id, "history": []}
+        try:
+            # 使用 updates 模式查看节点产出
+            async for event in app_graph.astream(inputs, stream_mode="updates"):
+                for node_name, output in event.items():
+                    payload = {"node": node_name, "output": output}
+                    yield f"data: {safe_json_dumps(payload)}\n\n"
+                    
+                    # 关键修复：强制让出 CPU，给 FastAPI 发送 buffer 的机会
+                    await asyncio.sleep(0.01) 
+        except Exception as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform", # 禁止代理压缩
+            "X-Accel-Buffering": "no",                # 专门针对 Nginx
+        }
+    )
+@router.get("/test-stream")
+async def test_stream():
+    async def generate():
+        for i in range(5):
+            yield f"data: ping {i}\n\n"
+            await asyncio.sleep(1) # 每秒发一次
+    return StreamingResponse(generate(), media_type="text/event-stream")
+--- 文件结束: app/api/nl2analysis.py ---
+
+
+====================================================================
+文件: app/core/config.py
+大小: 1064 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:12:16
+FilePath: /nl2analysis-agent/app/core/config.py
+'''
+import os
+from dataclasses import dataclass
+from dotenv import load_dotenv
+
+load_dotenv()
+
+@dataclass
+class Settings:
+    DB_TYPE: str = os.getenv("DB_TYPE", "postgres")
+    DB_HOST: str = os.getenv("DB_HOST", "localhost")
+    DB_PORT: int = int(os.getenv("DB_PORT", "5432"))
+    DB_NAME: str = os.getenv("DB_NAME", "demo")
+    DB_USER: str = os.getenv("DB_USER", "demo")
+    DB_PASSWORD: str = os.getenv("DB_PASSWORD", "demo")
+
+    REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
+    REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
+
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
+    BASE_URL: str = os.getenv("BASE_URL", "")
+
+    EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+    EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "")
+    EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
+
+settings = Settings()
+
+--- 文件结束: app/core/config.py ---
+
+
+====================================================================
+文件: app/core/db.py
+大小: 867 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:12:48
+FilePath: /alexqi/develop/nl2analysis-agent/app/core/db.py
+'''
+from sqlalchemy import create_engine
+from app.core.config import settings
+
+def build_db_url():
+    if settings.DB_TYPE == "postgres":
+        return f"postgresql+psycopg2://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+    elif settings.DB_TYPE == "doris":
+        return f"mysql+pymysql://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+    elif settings.DB_TYPE == "clickhouse":
+        return f"clickhouse+http://{settings.DB_USER}:{settings.DB_PASSWORD}@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+    else:
+        raise ValueError("Unsupported DB_TYPE")
+
+engine = create_engine(build_db_url(), pool_pre_ping=True)
+
+--- 文件结束: app/core/db.py ---
+
+
+====================================================================
+文件: app/core/schema_index.py
+大小: 1676 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:13:45
+FilePath: /nl2analysis-agent/app/core/schema_index.py
+'''
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+from langchain_openai import OpenAIEmbeddings
+from app.core.schema_loader import load_all_tables_schema
+from app.core.config import settings
+
+class SchemaIndex:
+    def __init__(self):
+        schema = load_all_tables_schema()
+        embedding_model = OpenAIEmbeddings(
+            model=settings.EMBEDDING_MODEL,
+            openai_api_key=settings.EMBEDDING_API_KEY or "dummy-key",
+            openai_api_base=settings.EMBEDDING_BASE_URL.rstrip("/") if hasattr(settings, "EMBEDDING_BASE_URL") and settings.EMBEDDING_BASE_URL else None,
+            # 建议也加上超时限制，防止卡死
+            request_timeout=10 ,
+            embedding_ctx_length=512, # 根据 bge-m3 限制设置
+            check_embedding_ctx_length=False,
+            # 如果网关极其严格，尝试添加这个参数来关闭额外的 OpenAI 默认行为
+            default_headers={"Accept": "application/json"},
+            # 某些网关不支持额外的参数，可以通过 extra_body 强制置空（如果 SDK 版本支持）
+        )
+        self.docs = [
+            Document(page_content=f"{t}: {', '.join(cols)}", metadata={"table": t})
+            for t, cols in schema.items()
+        ]
+        self.index = FAISS.from_documents(self.docs, embedding_model)
+
+    def retrieve(self, query: str, k: int = 5) -> list[str]:
+        docs = self.index.similarity_search(query, k=k)
+        return [d.page_content for d in docs]
+
+schema_index = SchemaIndex()
+
+--- 文件结束: app/core/schema_index.py ---
+
+
+====================================================================
+文件: app/core/schema_loader.py
+大小: 1026 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:13:04
+FilePath: /alexqi/develop/nl2analysis-agent/app/core/schema_loader.py
+'''
+from sqlalchemy import inspect
+from app.core.db import engine
+
+def load_all_tables_schema() -> dict:
+    inspector = inspect(engine)
+    schema = {}
+    for table in inspector.get_table_names():
+        # 排除掉 alembic 自带的版本控制表，减少干扰
+        if table == "alembic_version":
+            continue
+            
+        cols = inspector.get_columns(table)
+        formatted_cols = []
+        
+        for c in cols:
+            name = c['name']
+            type_str = str(c['type'])
+            comment = c.get('comment')  # 关键点：获取注释
+            
+            # 拼接格式：字段名(类型) - 注释内容
+            col_desc = f"{name}({type_str})"
+            if comment:
+                col_desc += f": {comment}"
+            
+            formatted_cols.append(col_desc)
+            
+        schema[table] = formatted_cols
+    return schema
+
+--- 文件结束: app/core/schema_loader.py ---
+
+
+====================================================================
+文件: app/llm/client.py
+大小: 3168 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:33:55
+FilePath: /nl2analysis-agent/app/llm/client.py
+'''
+import logging
+from typing import Optional
+from langchain_openai import ChatOpenAI
+from app.core.config import settings
+
+# 配置日志
+logger = logging.getLogger(__name__)
+
+def get_llm(
+    model: Optional[str] = None,
+    temperature: float = 0.0,
+    max_retries: int = 2,
+    request_timeout: int = 120
+) -> ChatOpenAI:
+    """
+    获取 LLM 客户端实例（带完整容错机制）
+    
+    Args:
+        model: 模型名称（优先使用参数，其次配置）
+        temperature: 生成温度
+        max_retries: 最大重试次数
+        request_timeout: 请求超时时间（秒）
+    
+    Returns:
+        ChatOpenAI 实例
+    
+    Raises:
+        ValueError: 关键配置缺失且无法自动修复
+    """
+    # 1. 确定模型名称（优先级：参数 > 配置 > 默认值）
+    model_name = model or settings.LLM_MODEL or "gpt-4o-mini"
+    if not model_name.strip():
+        raise ValueError("❌ LLM_MODEL 配置为空且未提供 model 参数")
+    
+    # 2. 处理 API Key（自部署场景容错）
+    api_key = settings.OPENAI_API_KEY
+    if not api_key:
+        # 自部署模型通常不需要真实 Key，但 LangChain 要求非空字符串
+        if settings.BASE_URL:
+            logger.warning(
+                "⚠️  OPENAI_API_KEY 未设置，但检测到 BASE_URL（自部署模式）。"
+                "使用占位符 'dummy-key-for-self-hosted' 绕过校验。"
+            )
+            api_key = "dummy-key-for-self-hosted"
+        else:
+            raise ValueError(
+                "❌ OPENAI_API_KEY 未设置！\n"
+                "  • 公有云服务：请设置环境变量 OPENAI_API_KEY\n"
+                "  • 自部署模型：请同时设置 BASE_URL 环境变量"
+            )
+    
+    # 3. 构建基础参数
+    llm_params = {
+        "model": model_name.strip(),
+        "api_key": api_key,
+        "temperature": temperature,
+        "max_retries": max_retries,
+        "request_timeout": request_timeout,
+        "verbose": settings.DEBUG if hasattr(settings, "DEBUG") else False,
+        "base_url": settings.BASE_URL if hasattr(settings, "BASE_URL") and settings.BASE_URL else None
+    }
+    
+    # 4. 添加自部署专属配置（BASE_URL）
+    if hasattr(settings, "BASE_URL") and settings.BASE_URL:
+        llm_params["base_url"] = settings.BASE_URL.rstrip("/")
+        logger.info(f"🔌 使用自部署模型: {settings.BASE_URL} | 模型: {model_name}")
+    else:
+        logger.info(f"☁️  使用公有云模型: {model_name}")
+    
+    # 5. 安全初始化（捕获配置错误）
+    try:
+        llm = ChatOpenAI(**llm_params)
+        logger.info(f"✅ LLM 客户端初始化成功 | 模型: {model_name}")
+        return llm
+    except Exception as e:
+        logger.exception("❌ LLM 客户端初始化失败")
+        raise RuntimeError(
+            f"LLM 初始化失败: {str(e)}\n"
+            f"  模型: {model_name}\n"
+            f"  Base URL: {llm_params.get('base_url', 'N/A')}\n"
+            f"  请检查配置和网络连通性"
+        ) from e
+--- 文件结束: app/llm/client.py ---
+
+
+====================================================================
+文件: app/main.py
+大小: 274 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:10:45
+FilePath: /alexqi/develop/nl2analysis-agent/app/main.py
+'''
+# app/main.py
+from fastapi import FastAPI
+from app.api.nl2analysis import router
+
+app = FastAPI(title="NL2Analysis Agent")
+app.include_router(router)
+
+--- 文件结束: app/main.py ---
+
+
+====================================================================
+文件: app/memory/backend.py
+大小: 963 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:14:27
+FilePath: /alexqi/develop/nl2analysis-agent/app/memory/backend.py
+'''
+import json
+import redis
+from app.memory.models import ChatMessage, SessionMemory
+from app.core.config import settings
+
+r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
+
+def key(user_id, session_id):
+    return f"session:{user_id}:{session_id}"
+
+def load_session(user_id, session_id) -> SessionMemory:
+    raw = r.get(key(user_id, session_id))
+    if not raw:
+        return SessionMemory(user_id=user_id, session_id=session_id)
+    data = json.loads(raw)
+    return SessionMemory(
+        user_id=user_id,
+        session_id=session_id,
+        messages=[ChatMessage(**m) for m in data["messages"]]
+    )
+
+def save_session(memory: SessionMemory):
+    r.set(key(memory.user_id, memory.session_id), json.dumps({
+        "messages": [m.__dict__ for m in memory.messages]
+    }), ex=86400)
+
+--- 文件结束: app/memory/backend.py ---
+
+
+====================================================================
+文件: app/memory/models.py
+大小: 391 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:17:08
+FilePath: /alexqi/develop/nl2analysis-agent/app/memory/models.py
+'''
+from dataclasses import dataclass, field
+from typing import List
+
+@dataclass
+class ChatMessage:
+    role: str
+    content: str
+
+@dataclass
+class SessionMemory:
+    user_id: str
+    session_id: str
+    messages: List[ChatMessage] = field(default_factory=list)
+--- 文件结束: app/memory/models.py ---
+
+
+====================================================================
+文件: app/tools/db_tool.py
+大小: 1741 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:34:35
+FilePath: /alexqi/develop/nl2analysis-agent/app/tools/db_tool.py
+'''
+# app/tools/db_tool.py
+from sqlalchemy import create_engine, text
+from app.core.config import settings
+import math
+from fastapi.encoders import jsonable_encoder
+# 1. 动态构建数据库连接字符串
+# 格式: postgresql+psycopg2://user:password@host:port/dbname
+DATABASE_URL = (
+    f"postgresql+psycopg2://{settings.DB_USER}:{settings.DB_PASSWORD}"
+    f"@{settings.DB_HOST}:{settings.DB_PORT}/{settings.DB_NAME}"
+)
+
+# 2. 创建全局 Engine 实例
+# 建议加上 pool_pre_ping=True 自动检测并处理断开的连接
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+
+def run_sql(sql: str) -> list[dict]:
+    """
+    执行 SQL 查询并返回结果列表
+    """
+    with engine.connect() as conn:
+        # 使用 mappings() 将每一行转换为字典格式
+        result = conn.execute(text(sql))
+        # 结果处理：将 RowMapping 对象转为标准的 dict 列表
+        return [dict(row) for row in result.mappings()]
+
+
+def clean_nans(obj):
+    """递归将 NaN 和 Inf 转换为 None"""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: clean_nans(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nans(x) for x in obj]
+    return obj
+
+# 如果你想测试是否连通，可以增加一个简单的测试逻辑
+if __name__ == "__main__":
+    try:
+        test_res = run_sql("SELECT 1 as test")
+        print("数据库连接测试成功:", test_res)
+    except Exception as e:
+        print("数据库连接失败:", str(e))
+--- 文件结束: app/tools/db_tool.py ---
+
+
+====================================================================
+文件: collect_code.sh
+大小: 3918 bytes
+====================================================================
+
+#!/bin/bash
+# collect_code.sh - 递归收集代码文件到单个文档
+# 用法: ./collect_code.sh [目录] [输出文件]
+# 示例: ./collect_code.sh . code_collection.txt
+
+set -euo pipefail
+
+TARGET_DIR="${1:-.}"
+OUTPUT_FILE="${2:-code_collection.txt}"
+
+# 代码文件扩展名白名单
+CODE_EXTS=(
+  "*.py" "*.js" "*.ts" "*.jsx" "*.tsx" "*.java" "*.go" "*.rs" "*.rb" "*.php"
+  "*.c" "*.cpp" "*.h" "*.hpp" "*.cs" "*.swift" "*.kt" "*.scala"
+  "*.toml" "*.yaml" "*.yml" "*.json" "*.xml" "*.ini" "*.cfg" "*.conf"
+  "*.md" "*.txt" "*.rst" "*.sh" "*.bash" "*.zsh" "*.fish"
+  "*.dockerfile" "Dockerfile" "*.dockerignore"
+  "*.sql" "*.sqlite" "*.pgsql" "*.mysql"
+  "*.html" "*.htm" "*.css" "*.scss" "*.less"
+  "requirements.txt" "pyproject.toml" "poetry.lock" "package.json" "Cargo.toml"
+  ".gitignore" ".dockerignore" "Makefile" "setup.py" "setup.cfg"
+)
+
+# 排除模式（黑名单）
+EXCLUDE_PATTERNS=(
+  ".env*"                  # 所有 .env 文件
+  "*.pyc" "*.pyo" "*.pyd"  # Python 字节码
+  "__pycache__"            # Python 缓存
+  ".git" ".svn" ".hg"      # 版本控制
+  ".venv" "venv" "env"     # 虚拟环境
+  "node_modules"           # Node 依赖
+  "*.log" "*.tmp" "*.temp" # 临时/日志
+  "*.jpg" "*.jpeg" "*.png" "*.gif" "*.bmp" "*.svg" "*.ico"  # 图片
+  "*.pdf" "*.doc" "*.docx" "*.xls" "*.xlsx" "*.ppt" "*.pptx" # 文档
+  "*.zip" "*.tar" "*.gz" "*.rar" "*.7z" "*.bz2" "*.xz"       # 压缩包
+  "*.exe" "*.dll" "*.so" "*.dylib" "*.bin" "*.o" "*.a"       # 二进制
+  "poetry.lock"            # 可选：排除锁文件（如需保留请删除此行）
+)
+
+log() { echo "[INFO] $1"; }
+error() { echo "[ERROR] $1" >&2; exit 1; }
+
+# 检查目录
+[[ ! -d "$TARGET_DIR" ]] && error "目录不存在: $TARGET_DIR"
+
+# 确认覆盖
+[[ -f "$OUTPUT_FILE" ]] && {
+  read -p "⚠️  输出文件已存在，将被覆盖 ($OUTPUT_FILE)。继续? (y/n): " -n 1 -r
+  echo
+  [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+}
+
+log "开始收集代码文件: $TARGET_DIR"
+log "输出文件: $OUTPUT_FILE"
+
+# 清空输出文件
+> "$OUTPUT_FILE"
+
+# 写入头部信息
+{
+  echo "========================================"
+  echo "  代码文件收集报告"
+  echo "========================================"
+  echo "源目录: $TARGET_DIR"
+  echo "收集时间: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "排除规则: ${EXCLUDE_PATTERNS[*]}"
+  echo "========================================"
+  echo
+} >> "$OUTPUT_FILE"
+
+file_count=0
+
+# 构建 find 命令：白名单 + 黑名单
+find_cmd=(find "$TARGET_DIR" -type f)
+
+# 添加白名单（-name 模式）
+for ext in "${CODE_EXTS[@]}"; do
+  find_cmd+=(-o -name "$ext")
+done
+find_cmd=(-type f \( -name "${CODE_EXTS[0]}" "${find_cmd[@]:3}" \))
+
+# 添加黑名单（-not -path）
+for pat in "${EXCLUDE_PATTERNS[@]}"; do
+  # 处理目录排除（如 .git/）
+  if [[ "$pat" == *"/"* || "$pat" == "."* ]]; then
+    find_cmd+=(-not -path "*/$pat/*" -not -name "$pat")
+  else
+    find_cmd+=(-not -name "$pat")
+  fi
+done
+
+# 执行 find 并处理
+while IFS= read -r filepath; do
+  relpath="${filepath#$TARGET_DIR/}"
+  
+  # 跳过空文件
+  [[ ! -s "$filepath" ]] && continue
+  
+  # 写入分隔符
+  {
+    echo "### File: $relpath"
+    echo "### Path: $filepath"
+    echo "### Size: $(wc -c < "$filepath") bytes"
+    echo
+    cat "$filepath" 2>/dev/null || echo "[ERROR: 无法读取文件]"
+    echo
+    echo "---"
+    echo
+  } >> "$OUTPUT_FILE"
+  
+  ((file_count++))
+  log "✓ $relpath"
+
+done < <(eval "${find_cmd[@]}" 2>/dev/null | sort)
+
+# 写入统计尾部
+{
+  echo
+  echo "========================================"
+  echo "  收集完成"
+  echo "========================================"
+  echo "总文件数: $file_count"
+  echo "输出文件: $OUTPUT_FILE"
+  echo "========================================"
+} >> "$OUTPUT_FILE"
+
+log "✅ 完成! 共收集 $file_count 个代码文件"
+log "输出: $OUTPUT_FILE"
+
+# 预览
+echo -e "\n📄 前 30 行预览:"
+head -n 30 "$OUTPUT_FILE"
+--- 文件结束: collect_code.sh ---
+
+
+====================================================================
+文件: collect_python.sh
+大小: 5776 bytes
+====================================================================
+
+#!/bin/bash
+# collect_python.sh - 最终修复版：确保收集所有文件
+set -euo pipefail
+
+TARGET_DIR="${1:-.}"
+OUTPUT_FILE="${2:-python_code.txt}"
+
+# 转换为绝对路径
+TARGET_DIR="$(realpath "$TARGET_DIR")"
+OUTPUT_FILE="$(realpath "$OUTPUT_FILE" 2>/dev/null || echo "$(pwd)/${OUTPUT_FILE}")"
+
+# 检查目录
+[[ ! -d "$TARGET_DIR" ]] && { echo "❌ 目录不存在: $TARGET_DIR" >&2; exit 1; }
+
+# 确保输出文件不在目标目录内
+if [[ "$OUTPUT_FILE" == "$TARGET_DIR"* ]] && [[ "$TARGET_DIR" != "$(dirname "$OUTPUT_FILE")" ]]; then
+    echo "⚠️  输出文件在目标目录内，可能会被意外收集"
+    read -p "是否继续? (y/n): " -n 1 -r
+    echo
+    [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+fi
+
+# 确认覆盖
+[[ -f "$OUTPUT_FILE" ]] && {
+  read -p "⚠️  输出文件已存在 ($OUTPUT_FILE)，将被覆盖。继续? (y/n): " -n 1 -r
+  echo
+  [[ ! $REPLY =~ ^[Yy]$ ]] && exit 1
+}
+
+echo "[+] 开始收集 Python 项目文件: $TARGET_DIR"
+
+# 清空输出
+> "$OUTPUT_FILE"
+
+# 写入头部
+cat > "$OUTPUT_FILE" << EOF
+========================================
+  Python 项目代码收集报告
+========================================
+源目录: $TARGET_DIR
+收集时间: $(date '+%Y-%m-%d %H:%M:%S')
+排除: .env*, __pycache__, .git, .venv, *.pyc, *.pyo, *.log
+========================================
+
+EOF
+
+file_count=0
+
+echo "[🔍] 正在扫描目录结构..." >&2
+
+# 修复关键：使用数组存储文件列表，避免 while 循环的 subshell 问题
+file_list=()
+
+# 先用 find 命令收集所有文件到数组
+while IFS= read -r filepath; do
+    [[ -f "$filepath" ]] && file_list+=("$filepath")
+done < <(
+  find "$TARGET_DIR" -type f \
+    ! -path "*/__pycache__/*" \
+    ! -path "*/.git/*" \
+    ! -path "*/.venv/*" \
+    ! -path "*/venv/*" \
+    ! -path "*/.env/*" \
+    ! -path "*/.tox/*" \
+    ! -path "*/.pytest_cache/*" \
+    ! -path "*/.mypy_cache/*" \
+    ! -path "*/build/*" \
+    ! -path "*/dist/*" \
+    ! -path "*/htmlcov/*" \
+    ! -path "*/node_modules/*" \
+    \( \
+      -name "*.py" -o \
+      -name "*.pyi" -o \
+      -name "*.toml" -o \
+      -name "*.yaml" -o \
+      -name "*.yml" -o \
+      -name "*.json" -o \
+      -name "*.md" -o \
+      -name "*.rst" -o \
+      -name "*.txt" -o \
+      -name "*.sh" -o \
+      -name "*.bash" -o \
+      -name "Dockerfile" -o \
+      -name "*.dockerfile" -o \
+      -name ".gitignore" -o \
+      -name ".dockerignore" -o \
+      -name "requirements*.txt" -o \
+      -name "pyproject.toml" -o \
+      -name "setup.py" -o \
+      -name "setup.cfg" -o \
+      -name "MANIFEST.in" -o \
+      -name "Makefile" -o \
+      -name "*.in" -o \
+      -name "*.cfg" -o \
+      -name "*.conf" \
+    \) \
+    ! -name ".env*" \
+    ! -name "*.pyc" \
+    ! -name "*.pyo" \
+    ! -name "*.log" \
+    ! -name "*.tmp" \
+    ! -name "*.bak" \
+    ! -name "*.swp" \
+    2>/dev/null | sort
+)
+
+# 如果没有找到文件
+if [[ ${#file_list[@]} -eq 0 ]]; then
+    echo "[❌] 没有找到任何符合条件的文件！" >&2
+    exit 1
+fi
+
+echo "[📊] 找到 ${#file_list[@]} 个文件，开始处理..." >&2
+
+# 处理每个文件
+for filepath in "${file_list[@]}"; do
+    # 检查文件是否可读且非空
+    [[ ! -r "$filepath" ]] && continue
+    [[ ! -s "$filepath" ]] && continue
+    
+    # 计算相对路径
+    relpath="${filepath#$TARGET_DIR/}"
+    if [[ "$filepath" == "$TARGET_DIR" ]]; then
+        relpath="."
+    elif [[ "$relpath" == "$filepath" ]]; then
+        relpath="$(realpath --relative-to="$TARGET_DIR" "$filepath" 2>/dev/null || echo "$filepath")"
+    fi
+    
+    # 显示进度
+    echo -ne "\r[处理中] 第 $((++file_count)) 个: $relpath" >&2
+    
+    # 写入文件内容
+    {
+        echo ""
+        echo "===================================================================="
+        echo "文件: $relpath"
+        echo "大小: $(wc -c < "$filepath" 2>/dev/null || echo "0") bytes"
+        echo "===================================================================="
+        echo ""
+        
+        # 检查是否为文本文件
+        if file "$filepath" | grep -q "text"; then
+            # 对于 .env 文件进行脱敏
+            if [[ "$(basename "$filepath")" == .env* ]]; then
+                echo "# ⚠️  敏感信息已脱敏"
+                echo ""
+                # 简单的脱敏处理
+                sed 's/\(.*PASSWORD.*=\).*/\1 ***/i; s/\(.*SECRET.*=\).*/\1 ***/i; s/\(.*KEY.*=\).*/\1 ***/i' "$filepath" 2>/dev/null || cat "$filepath"
+            else
+                cat "$filepath" 2>/dev/null || echo "[无法读取文件内容]"
+            fi
+        else
+            echo "[二进制文件，跳过内容展示]"
+        fi
+        
+        echo ""
+        echo "--- 文件结束: $relpath ---"
+        echo ""
+    } >> "$OUTPUT_FILE"
+done
+
+echo -e "\n\n[✅] 处理完成！" >&2
+
+# 写入尾部统计
+cat >> "$OUTPUT_FILE" << EOF
+
+========================================
+  收集完成统计
+========================================
+总文件数: $file_count
+输出文件: $OUTPUT_FILE
+生成时间: $(date)
+========================================
+EOF
+
+echo
+echo "[✅] 完成! 共收集 $file_count 个文件 -> $OUTPUT_FILE"
+
+if [[ $file_count -gt 0 ]]; then
+    # 按目录分组显示
+    echo -e "\n[📋] 按目录分组统计:"
+    grep "^文件:" "$OUTPUT_FILE" | cut -d' ' -f2- | while read -r file; do
+        dirname "$file"
+    done | sort | uniq -c | sort -nr | head -10
+
+    echo -e "\n[📋] 前10个文件列表:"
+    grep "^文件:" "$OUTPUT_FILE" | head -10 | sed 's/文件: //'
+    
+    # 显示输出文件大小
+    echo -e "\n[📏] 输出文件大小: $(du -h "$OUTPUT_FILE" | cut -f1)"
+else
+    echo "[❌] 没有找到任何文件！"
+fi
+
+echo -e "\n[💡] 提示: 使用 'less $OUTPUT_FILE' 查看完整内容"
+--- 文件结束: collect_python.sh ---
+
+
+====================================================================
+文件: debug_output.txt
+大小: 662 bytes
+====================================================================
+
+### File: ./src/agent_mulit/__init__.py
+---
+### File: ./src/agent_mulit/main.py
+---
+### File: ./app/llm/client.py
+---
+### File: ./app/agent/state.py
+---
+### File: ./app/agent/nodes.py
+---
+### File: ./app/agent/graph.py
+---
+### File: ./app/tools/db_tool.py
+---
+### File: ./app/main.py
+---
+### File: ./app/memory/backend.py
+---
+### File: ./app/memory/models.py
+---
+### File: ./app/api/chat.py
+---
+### File: ./app/api/nl2analysis.py
+---
+### File: ./app/core/config.py
+---
+### File: ./app/core/schema_loader.py
+---
+### File: ./app/core/db.py
+---
+### File: ./app/core/schema_index.py
+---
+### File: ./app/analysis/analyzer.py
+---
+### File: ./app/analysis/chart.py
+---
+
+--- 文件结束: debug_output.txt ---
+
+
+====================================================================
+文件: docker-compose.yml
+大小: 537 bytes
+====================================================================
+
+version: "3.9"
+
+services:
+  agent-api:
+    image: agent-nl2sql:latest
+    container_name: agent-nl2sql-api
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "23010:23010"
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:23010/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+
+--- 文件结束: docker-compose.yml ---
+
+
+====================================================================
+文件: pyproject.toml
+大小: 733 bytes
+====================================================================
+
+[project]
+name = "agent"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "qifuxiao",email = "867225266@qq.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "langgraph (>=1.0.8,<2.0.0)",
+    "langchain (>=1.2.10,<2.0.0)",
+    "langchain-community (>=0.4.1,<0.5.0)",
+    "langchain-deepseek (>=1.0.1,<2.0.0)",
+    "langchain-openai (>=1.1.9,<2.0.0)",
+    "redis (>=7.1.1,<8.0.0)",
+    "fastapi (>=0.129.0,<0.130.0)",
+    "pandas (>=3.0.0,<4.0.0)",
+    "plotly (>=6.5.2,<7.0.0)",
+    "uvicorn (>=0.40.0,<0.41.0)",
+    "psycopg2-binary (>=2.9.11,<3.0.0)",
+    "faiss-cpu (>=1.13.2,<2.0.0)",
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+--- 文件结束: pyproject.toml ---
+
+
+====================================================================
+文件: python_code.txt
+大小: 40977 bytes
+====================================================================
+
+[无法读取文件内容]
+
+--- 文件结束: python_code.txt ---
+
+
+====================================================================
+文件: scripts/start.sh
+大小: 211 bytes
+====================================================================
+
+#!/bin/bash
+###
+ # @Author: qifuxiao 867225266@qq.com
+ # @Date: 2026-02-14 02:24:28
+ # @FilePath: /alexqi/develop/nl2analysis-agent/scripts/start.sh
+### 
+set -e
+cp .env.example .env
+docker compose up -d --build
+
+--- 文件结束: scripts/start.sh ---
+
+
+====================================================================
+文件: src/agent_mulit/main.py
+大小: 891 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-13 09:28:42
+FilePath: /alexqi/develop/Agent/src/agent_mulit/main.py
+'''
+import os 
+api_key = os.getenv("OPENAI_API_KEY")
+
+from langchain_openai import ChatOpenAI
+
+model = ChatOpenAI(
+    model="deepseek-v3-0324",
+    
+    api_key=api_key,
+    base_url="http://10.231.4.6:30109/CIDC-ECSO-109/inference-proxy/792563b5-943d-434e-95f2-b9c94d5719c5/aiops-1421977318167711744/deepseek-v3-0324/service/8080/v1",
+)
+
+a=model.invoke("你是谁？能帮我解决什么问题？")
+print(f"模型回答：{a}")
+
+from langchain.agents import create_agent
+from langchain_community.tools import tool
+
+agent = create_agent(
+    model=model,
+    tools=[],
+    system_prompt="你是一个专业助手"
+)
+
+# 背后自动跑在 LangGraph 运行时上
+result = agent.invoke({"messages": [{"role": "user", "content": "你好"}]})
+print(f"Agent回答：{result}")
+--- 文件结束: src/agent_mulit/main.py ---
+
+
+====================================================================
+文件: test_connection.py
+大小: 519 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 07:05:28
+FilePath: /nl2analysis-agent/test_connection.py
+'''
+# test_connection.py
+from app.core.db import engine
+from app.llm.client import get_llm
+
+try:
+    print("正在连接数据库...")
+    with engine.connect() as conn:
+        print("✅ 数据库连接成功")
+    
+    print("正在连接LLM...")
+    llm = get_llm()
+    res = llm.invoke("ping")
+    print(f"✅ LLM 响应成功: {res.content}")
+except Exception as e:
+    print(f"❌ 测试失败: {e}")
+--- 文件结束: test_connection.py ---
+
+
+========================================
+  收集完成统计
+========================================
+总文件数: 28
+输出文件: /home/alexqi/develop/nl2analysis-agent/python_code.txt
+生成时间: Mon Feb 16 05:52:30 UTC 2026
+========================================

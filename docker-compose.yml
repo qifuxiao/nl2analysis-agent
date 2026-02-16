@@ -1,0 +1,30 @@
+version: "3.9"
+
+services:
+  agent-api:
+    image: agent-nl2sql:latest
+    container_name: agent-nl2sql-api
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "23010:23010"
+    depends_on:
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:23010/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  redis:
+    image: redis:7-alpine
+    container_name: agent-redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
