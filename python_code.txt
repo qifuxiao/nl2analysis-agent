@@ -2,9 +2,92 @@
   Python 项目代码收集报告
 ========================================
 源目录: /home/alexqi/develop/nl2analysis-agent
-收集时间: 2026-02-16 05:52:30
+收集时间: 2026-02-17 02:00:43
 排除: .env*, __pycache__, .git, .venv, *.pyc, *.pyo, *.log
 ========================================
+
+
+====================================================================
+文件: .gitignore
+大小: 713 bytes
+====================================================================
+
+# 虚拟环境
+venv/
+env/
+ENV/
+myenv/
+.venv/
+*.venv
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# 日志文件
+*.log
+logs/
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# 数据库
+*.sqlite3
+*.db
+*.sqlite
+*.sql
+*.db-journal
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 环境变量（关键敏感文件）
+.env
+.env.test
+.env.prod
+.env.*
+!.env.example  # 保留示例文件
+!.env.template
+
+# 备份和临时文件
+code_*.txt
+code_backup_*.txt
+temp_*.txt
+backup_*
+*.bak
+*.tmp
+
+# 脚本文件
+collect_code.sh
+backup_*.sh
+temp_*.sh
+*.sh
+!deploy.sh
+!startup.sh
+
+# 密钥和证书
+*.pem
+*.key
+*.crt
+*.p12
+secrets/
+keys/
+--- 文件结束: .gitignore ---
 
 
 ====================================================================
@@ -98,7 +181,7 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
 ====================================================================
 文件: README.md
-大小: 598 bytes
+大小: 809 bytes
 ====================================================================
 
 <!--
@@ -134,24 +217,28 @@ Body:
 
 # 开发环境运行命令
 `poetry run uvicorn app.main:app --host 0.0.0.0 --port 8000`
+
+# 测试命令：
+`curl -N -X POST http://localhost:8000/nl2analysis/stream \
+     -H "Content-Type: application/json" \
+     -d '{"query": "查询学生专业分布", "user_id": "alex", "session_id": "123"}'`
 --- 文件结束: README.md ---
 
 
 ====================================================================
 文件: app/agent/graph.py
-大小: 1124 bytes
+大小: 591 bytes
 ====================================================================
 
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:15:10
-FilePath: /alexqi/develop/nl2analysis-agent/app/agent/graph.py
-'''
+# app/agent/graph.py
+
 from langgraph.graph import StateGraph
 from app.agent.state import AgentState
 from app.agent.nodes import (
-    pre_memory_node, nl2sql_node, db_query_node,
-    analysis_node, chart_node, clarification_node, post_memory_node
+    pre_memory_node,
+    nl2sql_node,
+    db_query_node,
+    analysis_node,
 )
 
 graph = StateGraph(AgentState)
@@ -160,21 +247,12 @@ graph.add_node("pre_memory", pre_memory_node)
 graph.add_node("nl2sql", nl2sql_node)
 graph.add_node("query_db", db_query_node)
 graph.add_node("analysis", analysis_node)
-# graph.add_node("chart", chart_node)
-graph.add_node("clarify", clarification_node)
-graph.add_node("post_memory", post_memory_node)
 
 graph.set_entry_point("pre_memory")
+
 graph.add_edge("pre_memory", "nl2sql")
 graph.add_edge("nl2sql", "query_db")
-
-def router(state):
-    return "clarify" if state.get("error") else "analysis"
-
-graph.add_conditional_edges("query_db", router, {"clarify": "clarify", "analysis": "analysis"})
-# graph.add_edge("analysis", "chart")
-# graph.add_edge("chart", "post_memory")
-graph.add_edge("clarify", "nl2sql")
+graph.add_edge("query_db", "analysis")
 
 app_graph = graph.compile()
 
@@ -183,12 +261,12 @@ app_graph = graph.compile()
 
 ====================================================================
 文件: app/agent/nodes.py
-大小: 3655 bytes
+大小: 4030 bytes
 ====================================================================
 
 from app.llm.client import get_llm
 from app.tools.db_tool import run_sql
-from app.analysis.analyzer import analyze_data
+from app.analysis.analyzer import build_analysis_prompt
 from app.core.schema_index import schema_index
 from app.memory.backend import load_session, save_session
 from app.analysis.chart import generate_chart_html
@@ -197,6 +275,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
 import asyncio
 import re
+from app.agent.state import AgentState
 
 llm = get_llm()
 
@@ -232,7 +311,13 @@ async def nl2sql_node(state):
     clean_sql = extract_pure_sql(raw_sql)
     print(f"--- Generated SQL ---\n{clean_sql}\n---------------------")
     return {"sql": clean_sql}
+# async def nl2sql_node(state):
+#     print("nl2sql start")
 
+#     async for chunk in llm.astream(state["query"]):
+#         print("TOKEN:", chunk.content)
+
+#     return {"sql": "SELECT 1"}
 async def db_query_node(state):
     try:
         # 使用 run_in_executor 避免 SQL 查询阻塞事件循环
@@ -245,10 +330,17 @@ async def db_query_node(state):
         return {"error": str(e)}
 
 async def analysis_node(state):
-    # analyze_data 已经是异步的了
-    result = await analyze_data(state["raw_data"], state["query"])
-    return {"analysis": result}
+    raw_data = state.get("raw_data")
+    query = state.get("query")
 
+    from app.analysis.analyzer import build_analysis_prompt
+
+    prompt = build_analysis_prompt(raw_data, query)
+    print(f"{prompt=}")
+    print("***"*10)
+    return {
+        "analysis_prompt": prompt
+    }
 async def clarification_node(state):
     prompt = f"用户问题：{state['query']}\n错误信息：{state.get('error')}\n请生成一句澄清问题。"
     # 使用 ainvoke
@@ -318,34 +410,26 @@ class AgentState(TypedDict):
 
 ====================================================================
 文件: app/analysis/analyzer.py
-大小: 931 bytes
+大小: 407 bytes
 ====================================================================
 
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:32:08
-LastEditors: qifuxiao 867225266@qq.com
-LastEditTime: 2026-02-16 05:42:36
-FilePath: /nl2analysis-agent/app/analysis/analyzer.py
-Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
-'''
 import pandas as pd
-from app.llm.client import get_llm
 
-llm = get_llm()
-
-async def analyze_data(data: list[dict], query: str) -> dict:
+def build_analysis_prompt(data: list[dict], query: str) -> str:
     df = pd.DataFrame(data)
     if df.empty:
-        return {"summary": "本次查询无数据。"}
+        return "本次查询无数据。"
 
     stats = df.describe(include="all").to_dict()
-    prompt = f"用户问题：{query}\n统计信息：{stats}\n请输出中文业务结论，并给出1-2条运营建议。"
-    
-    # 确保是 ainvoke
-    response = await llm.ainvoke(prompt) 
-    summary = response.content.strip()
-    return {"summary": summary, "stats": stats}
+
+    prompt = (
+        f"用户问题：{query}\n"
+        f"统计信息：{stats}\n"
+        f"请输出中文业务结论，并给出1-2条运营建议。"
+    )
+
+    return prompt
+
 --- 文件结束: app/analysis/analyzer.py ---
 
 
@@ -412,7 +496,7 @@ def chat(req: ChatReq, user_id: str = Depends(get_current_user)):
 
 ====================================================================
 文件: app/api/nl2analysis.py
-大小: 2741 bytes
+大小: 3882 bytes
 ====================================================================
 
 '''
@@ -437,51 +521,92 @@ class QueryReq(BaseModel):
     user_id: str = "default_user"     # 添加默认值，防止旧客户端报错
     session_id: str = "default_session"
 
-@router.post("/nl2analysis")
-def nl2analysis(req: QueryReq):
-    # 将接收到的参数全部塞进 Graph 的初始输入中
-    result= app_graph.invoke({
-        "query": req.query, 
-        "history": [],
-        "user_id": req.user_id,
-        "session_id": req.session_id
-    })
-
-    return clean_nans(jsonable_encoder(result))
-def safe_json_dumps(obj):
-    """处理 NaN/Inf 并序列化"""
-    def _clean(o):
-        if isinstance(o, float):
-            return None if math.isnan(o) or math.isinf(o) else o
-        if isinstance(o, dict): return {k: _clean(v) for k, v in o.items()}
-        if isinstance(o, list): return [_clean(x) for x in o]
-        return o
-    return json.dumps(_clean(jsonable_encoder(obj)), ensure_ascii=False)
 
 @router.post("/nl2analysis/stream")
 async def nl2analysis_stream(req: QueryReq):
+
     async def event_generator():
-        inputs = {"query": req.query, "user_id": req.user_id, "session_id": req.session_id, "history": []}
         try:
-            # 使用 updates 模式查看节点产出
-            async for event in app_graph.astream(inputs, stream_mode="updates"):
+            inputs = {
+                "query": req.query,
+                "user_id": req.user_id,
+                "session_id": req.session_id,
+                "history": []
+            }
+
+            async for event in app_graph.astream(
+                inputs,
+                stream_mode="updates"
+            ):
                 for node_name, output in event.items():
-                    payload = {"node": node_name, "output": output}
-                    yield f"data: {safe_json_dumps(payload)}\n\n"
-                    
-                    # 关键修复：强制让出 CPU，给 FastAPI 发送 buffer 的机会
-                    await asyncio.sleep(0.01) 
+
+                    # ===============================
+                    # 1️⃣  analysis 节点（手动控制 LLM streaming）
+                    # ===============================
+                    if node_name == "analysis":
+
+                        if not output:
+                            yield _sse({"node": "analysis_error", "msg": "analysis output is None"})
+                            continue
+
+                        prompt = output.get("analysis_prompt")
+                        if not prompt:
+                            yield _sse({"node": "analysis_error", "msg": "analysis_prompt missing"})
+                            continue
+
+                        from app.llm.client import get_llm
+                        llm = get_llm()
+
+                        yield _sse({"node": "analysis_start"})
+
+                        try:
+                            async for chunk in llm.astream(prompt):
+                                token = getattr(chunk, "content", None)
+                                if token:
+                                    yield _sse({
+                                        "node": "analysis_token",
+                                        "content": token
+                                    })
+
+                        except Exception as llm_error:
+                            yield _sse({
+                                "node": "analysis_error",
+                                "msg": str(llm_error)
+                            })
+
+                        yield _sse({"node": "analysis_end"})
+
+                    # ===============================
+                    # 2️⃣  其它普通节点
+                    # ===============================
+                    else:
+                        payload = {
+                            "node": node_name,
+                            "output": output or {}
+                        }
+                        yield _sse(payload)
+
+                    await asyncio.sleep(0)
+
         except Exception as e:
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield _sse({
+                "node": "system_error",
+                "msg": str(e)
+            })
+
 
     return StreamingResponse(
         event_generator(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache, no-transform", # 禁止代理压缩
-            "X-Accel-Buffering": "no",                # 专门针对 Nginx
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
         }
     )
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
 @router.get("/test-stream")
 async def test_stream():
     async def generate():
@@ -1354,7 +1479,7 @@ build-backend = "poetry.core.masonry.api"
 
 ====================================================================
 文件: python_code.txt
-大小: 40977 bytes
+大小: 42571 bytes
 ====================================================================
 
 [无法读取文件内容]
@@ -1451,7 +1576,7 @@ except Exception as e:
 ========================================
   收集完成统计
 ========================================
-总文件数: 28
+总文件数: 29
 输出文件: /home/alexqi/develop/nl2analysis-agent/python_code.txt
-生成时间: Mon Feb 16 05:52:30 UTC 2026
+生成时间: Tue Feb 17 02:00:43 UTC 2026
 ========================================

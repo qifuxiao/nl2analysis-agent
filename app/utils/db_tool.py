@@ -8,6 +8,7 @@ from sqlalchemy import create_engine, text
 from app.core.config import settings
 import math
 from fastapi.encoders import jsonable_encoder
+import re
 # 1. 动态构建数据库连接字符串
 # 格式: postgresql+psycopg2://user:password@host:port/dbname
 DATABASE_URL = (
@@ -28,7 +29,12 @@ def run_sql(sql: str) -> list[dict]:
         result = conn.execute(text(sql))
         # 结果处理：将 RowMapping 对象转为标准的 dict 列表
         return [dict(row) for row in result.mappings()]
-
+def extract_pure_sql(text: str) -> str:
+    text = re.sub(r"```sql\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```\n?", "", text)
+    if ";" in text:
+        text = text.split(";")[0] + ";"
+    return text.strip()
 
 def clean_nans(obj):
     """递归将 NaN 和 Inf 转换为 None"""

@@ -5,7 +5,7 @@ FilePath: /alexqi/develop/nl2analysis-agent/app/main.py
 '''
 # app/main.py
 from fastapi import FastAPI
-from app.api.nl2analysis import router
+from app.router.nl2analysis import router
 
 app = FastAPI(title="NL2Analysis Agent")
 app.include_router(router)
