@@ -2,7 +2,7 @@
 Author: qifuxiao 867225266@qq.com
 Date: 2026-02-17 02:09:17
 LastEditors: qifuxiao 867225266@qq.com
-LastEditTime: 2026-02-17 02:31:46
+LastEditTime: 2026-02-18 00:49:54
 FilePath: /nl2analysis-agent/app/router/nl2analysis.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -11,12 +11,14 @@ Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查�
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 import asyncio
+from app.memory.backend import load_session
+from app.graph.nodes import post_memory_node
 
 from app.graph.graph import app_graph
 from app.llm.service import LLMService
 from app.utils.sse import sse_pack
 from app.schemas.query import QueryReq
-
+from app.core.logger import logger
 router = APIRouter()
 
 
@@ -24,12 +26,17 @@ router = APIRouter()
 async def nl2analysis_stream(req: QueryReq):
 
     async def event_generator():
+        # ⚡ 读取历史
+        session_mem = load_session(req.user_id, req.session_id)
+        from dataclasses import asdict
+
+        history = [asdict(m) for m in session_mem.messages]
 
         inputs = {
             "query": req.query,
             "user_id": req.user_id,
             "session_id": req.session_id,
-            "history": []
+            "history": history
         }
 
         llm_service = LLMService(tenant_id=req.tenant_id)
@@ -38,40 +45,75 @@ async def nl2analysis_stream(req: QueryReq):
 
             for node_name, output in event.items():
 
-                # ===============================
-                # 这里开始接管 analysis streaming
-                # ===============================
-                if node_name == "analysis":
+                try:
+                    # ===============================
+                    # 🔥 接管 analysis_prompt 流式输出
+                    # ===============================
+                    if node_name == "analysis_prompt":
 
-                    prompt = output.get("analysis_prompt")
+                        prompt = output.get("analysis_prompt")
 
-                    if not prompt:
-                        yield sse_pack({
-                            "node": "analysis_error",
-                            "msg": "analysis_prompt missing"
+                        if not prompt:
+                            logger.error(
+                                f"[Session {req.session_id}] analysis_prompt missing. Event: {output}"
+                            )
+                            yield sse_pack({
+                                "node": "analysis_error",
+                                "msg": "analysis_prompt missing"
+                            })
+                            continue
+
+                        yield sse_pack({"node": "analysis_start"})
+
+                        full_text = ""
+
+                        # 🔥 真正流式
+                        async for token in llm_service.astream(prompt):
+
+                            if token:
+                                full_text += token
+
+                                yield sse_pack({
+                                    "node": "analysis_token",
+                                    "content": token
+                                })
+
+                        # 🔥 流式结束后写回 history
+                        inputs.setdefault("history", [])
+                        inputs["history"].append({
+                            "type": "AIMessage",
+                            "content": full_text,
+                            "additional_kwargs": {}
                         })
-                        continue
 
-                    # 👇👇👇 就写在这里
-                    yield sse_pack({"node": "analysis_start"})
+                        yield sse_pack({"node": "analysis_end"})
 
-                    async for token in llm_service.astream(prompt):
-
+                        # ===============================
+                        # 🔥 在这里保存 memory
+                        # ===============================
+                        try:
+                            await post_memory_node({
+                                "user_id": req.user_id,
+                                "session_id": req.session_id,
+                                "history": inputs["history"]
+                            })
+                        except Exception:
+                            logger.exception(f"[Session {req.session_id}] memory save failed")
+                    # ===============================
+                    # 其他节点透传
+                    # ===============================
+                    else:
                         yield sse_pack({
-                            "node": "analysis_token",
-                            "content": token
+                            "node": node_name,
+                            "output": output
                         })
 
-                    yield sse_pack({"node": "analysis_end"})
+                    await asyncio.sleep(0)
 
-                # 其他 graph 节点直接透传
-                else:
-                    yield sse_pack({
-                        "node": node_name,
-                        "output": output
-                    })
-
-                await asyncio.sleep(0)
+                except Exception:
+                    logger.exception(
+                        f"[Session {req.session_id}] Error processing node {node_name}"
+                    )
 
     return StreamingResponse(
         event_generator(),
@@ -81,4 +123,3 @@ async def nl2analysis_stream(req: QueryReq):
             "X-Accel-Buffering": "no",
         }
     )
-

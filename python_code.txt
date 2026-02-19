@@ -2,7 +2,7 @@
   Python 项目代码收集报告
 ========================================
 源目录: /home/alexqi/develop/nl2analysis-agent
-收集时间: 2026-02-17 02:00:43
+收集时间: 2026-02-18 00:04:04
 排除: .env*, __pycache__, .git, .venv, *.pyc, *.pyo, *.log
 ========================================
 
@@ -226,400 +226,8 @@ Body:
 
 
 ====================================================================
-文件: app/agent/graph.py
-大小: 591 bytes
-====================================================================
-
-# app/agent/graph.py
-
-from langgraph.graph import StateGraph
-from app.agent.state import AgentState
-from app.agent.nodes import (
-    pre_memory_node,
-    nl2sql_node,
-    db_query_node,
-    analysis_node,
-)
-
-graph = StateGraph(AgentState)
-
-graph.add_node("pre_memory", pre_memory_node)
-graph.add_node("nl2sql", nl2sql_node)
-graph.add_node("query_db", db_query_node)
-graph.add_node("analysis", analysis_node)
-
-graph.set_entry_point("pre_memory")
-
-graph.add_edge("pre_memory", "nl2sql")
-graph.add_edge("nl2sql", "query_db")
-graph.add_edge("query_db", "analysis")
-
-app_graph = graph.compile()
-
---- 文件结束: app/agent/graph.py ---
-
-
-====================================================================
-文件: app/agent/nodes.py
-大小: 4030 bytes
-====================================================================
-
-from app.llm.client import get_llm
-from app.tools.db_tool import run_sql
-from app.analysis.analyzer import build_analysis_prompt
-from app.core.schema_index import schema_index
-from app.memory.backend import load_session, save_session
-from app.analysis.chart import generate_chart_html
-from app.memory.models import ChatMessage
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-import asyncio
-import re
-from app.agent.state import AgentState
-
-llm = get_llm()
-
-def extract_pure_sql(text: str) -> str:
-    text = re.sub(r"```sql\n?", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"```\n?", "", text)
-    if ";" in text:
-        text = text.split(";")[0] + ";"
-    return text.strip()
-
-async def pre_memory_node(state):
-    # 异步包装同步 IO
-    loop = asyncio.get_event_loop()
-    memory = await loop.run_in_executor(None, load_session, state["user_id"], state["session_id"])
-    return {"history": [m.__dict__ for m in memory.messages]}
-
-async def nl2sql_node(state):
-    tables = schema_index.retrieve(state["query"], k=5)
-    tables_schema = "\n".join(tables)
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "你是一个专业的 SQL 生成专家。请根据表结构生成 SELECT 语句。严禁 Markdown 标签。\n\n【表结构】\n{schema}"),
-        ("human", "{question}")
-    ])
-
-    sql_chain = prompt | llm | StrOutputParser()
-    # 使用 ainvoke 异步调用
-    raw_sql = await sql_chain.ainvoke({
-        "schema": tables_schema,
-        "question": state["query"]
-    })
-
-    clean_sql = extract_pure_sql(raw_sql)
-    print(f"--- Generated SQL ---\n{clean_sql}\n---------------------")
-    return {"sql": clean_sql}
-# async def nl2sql_node(state):
-#     print("nl2sql start")
-
-#     async for chunk in llm.astream(state["query"]):
-#         print("TOKEN:", chunk.content)
-
-#     return {"sql": "SELECT 1"}
-async def db_query_node(state):
-    try:
-        # 使用 run_in_executor 避免 SQL 查询阻塞事件循环
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, run_sql, state["sql"])
-        if not data:
-            return {"error": "查询结果为空", "raw_data": []}
-        return {"raw_data": data}
-    except Exception as e:
-        return {"error": str(e)}
-
-async def analysis_node(state):
-    raw_data = state.get("raw_data")
-    query = state.get("query")
-
-    from app.analysis.analyzer import build_analysis_prompt
-
-    prompt = build_analysis_prompt(raw_data, query)
-    print(f"{prompt=}")
-    print("***"*10)
-    return {
-        "analysis_prompt": prompt
-    }
-async def clarification_node(state):
-    prompt = f"用户问题：{state['query']}\n错误信息：{state.get('error')}\n请生成一句澄清问题。"
-    # 使用 ainvoke
-    res = await llm.ainvoke(prompt)
-    question = res.content.strip()
-    return {"analysis": {"need_clarification": True, "question": question}}
-
-async def post_memory_node(state):
-    loop = asyncio.get_event_loop()
-    def _save():
-        memory = load_session(state["user_id"], state["session_id"])
-        memory.messages.append(ChatMessage(role="user", content=state["query"]))
-        memory.messages.append(ChatMessage(role="assistant", content=state["analysis"].get("summary", "")))
-        save_session(memory)
-    await loop.run_in_executor(None, _save)
-    return {}
-async def chart_node(state):
-    """
-    异步图表生成节点
-    """
-    # 检查是否有数据可供绘图
-    if not state.get("raw_data"):
-        return {"analysis": state.get("analysis", {})}
-
-    # 将同步的图表生成逻辑放入线程池执行，防止阻塞 SSE 流
-    loop = asyncio.get_event_loop()
-    html = await loop.run_in_executor(
-        None, 
-        generate_chart_html, 
-        state["raw_data"], 
-        state["query"]
-    )
-    
-    # 更新状态中的 analysis 字典
-    current_analysis = state.get("analysis", {})
-    current_analysis["chart_html"] = html
-    
-    return {"analysis": current_analysis}
---- 文件结束: app/agent/nodes.py ---
-
-
-====================================================================
-文件: app/agent/state.py
-大小: 415 bytes
-====================================================================
-
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:17:48
-FilePath: /alexqi/develop/nl2analysis-agent/app/agent/state.py
-'''
-# app/agent/state.py
-from typing import TypedDict, Optional, List
-
-class AgentState(TypedDict):
-    user_id: str
-    session_id: str
-    query: str
-    history: List[dict]
-    sql: Optional[str]
-    raw_data: Optional[list[dict]]
-    analysis: Optional[dict]
-    error: Optional[str]
-
---- 文件结束: app/agent/state.py ---
-
-
-====================================================================
-文件: app/analysis/analyzer.py
-大小: 407 bytes
-====================================================================
-
-import pandas as pd
-
-def build_analysis_prompt(data: list[dict], query: str) -> str:
-    df = pd.DataFrame(data)
-    if df.empty:
-        return "本次查询无数据。"
-
-    stats = df.describe(include="all").to_dict()
-
-    prompt = (
-        f"用户问题：{query}\n"
-        f"统计信息：{stats}\n"
-        f"请输出中文业务结论，并给出1-2条运营建议。"
-    )
-
-    return prompt
-
---- 文件结束: app/analysis/analyzer.py ---
-
-
-====================================================================
-文件: app/analysis/chart.py
-大小: 470 bytes
-====================================================================
-
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:31:47
-FilePath: /alexqi/develop/nl2analysis-agent/app/analysis/chart.py
-'''
-import pandas as pd
-import plotly.express as px
-
-def generate_chart_html(data: list[dict], title: str) -> str:
-    df = pd.DataFrame(data)
-    if df.empty or len(df.columns) < 2:
-        return "<p>暂无可视化数据</p>"
-
-    x, y = df.columns[:2]
-    fig = px.bar(df, x=x, y=y, title=title)
-    return fig.to_html(full_html=False)
-
---- 文件结束: app/analysis/chart.py ---
-
-
-====================================================================
-文件: app/api/chat.py
-大小: 663 bytes
-====================================================================
-
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:15:46
-FilePath: /alexqi/develop/nl2analysis-agent/app/api/chat.py
-'''
-from fastapi import APIRouter, Depends
-from pydantic import BaseModel
-from app.agent.graph import app_graph
-
-router = APIRouter()
-
-class ChatReq(BaseModel):
-    session_id: str
-    query: str
-
-def get_current_user():
-    return "user_001"  # TODO: 接 JWT / API Key
-
-@router.post("/v1/agent/chat")
-def chat(req: ChatReq, user_id: str = Depends(get_current_user)):
-    state = {
-        "user_id": user_id,
-        "session_id": req.session_id,
-        "query": req.query,
-        "history": []
-    }
-    return app_graph.invoke(state)
-
---- 文件结束: app/api/chat.py ---
-
-
-====================================================================
-文件: app/api/nl2analysis.py
-大小: 3882 bytes
-====================================================================
-
-'''
-Author: qifuxiao 867225266@qq.com
-Date: 2026-02-14 02:31:11
-FilePath: /alexqi/develop/nl2analysis-agent/app/api/nl2analysis.py
-'''
-# app/api/nl2analysis.py
-import json
-import asyncio
-import math
-from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from fastapi.encoders import jsonable_encoder
-from app.agent.graph import app_graph
-from app.tools.db_tool import clean_nans
-router = APIRouter()
-
-class QueryReq(BaseModel):
-    query: str
-    user_id: str = "default_user"     # 添加默认值，防止旧客户端报错
-    session_id: str = "default_session"
-
-
-@router.post("/nl2analysis/stream")
-async def nl2analysis_stream(req: QueryReq):
-
-    async def event_generator():
-        try:
-            inputs = {
-                "query": req.query,
-                "user_id": req.user_id,
-                "session_id": req.session_id,
-                "history": []
-            }
-
-            async for event in app_graph.astream(
-                inputs,
-                stream_mode="updates"
-            ):
-                for node_name, output in event.items():
-
-                    # ===============================
-                    # 1️⃣  analysis 节点（手动控制 LLM streaming）
-                    # ===============================
-                    if node_name == "analysis":
-
-                        if not output:
-                            yield _sse({"node": "analysis_error", "msg": "analysis output is None"})
-                            continue
-
-                        prompt = output.get("analysis_prompt")
-                        if not prompt:
-                            yield _sse({"node": "analysis_error", "msg": "analysis_prompt missing"})
-                            continue
-
-                        from app.llm.client import get_llm
-                        llm = get_llm()
-
-                        yield _sse({"node": "analysis_start"})
-
-                        try:
-                            async for chunk in llm.astream(prompt):
-                                token = getattr(chunk, "content", None)
-                                if token:
-                                    yield _sse({
-                                        "node": "analysis_token",
-                                        "content": token
-                                    })
-
-                        except Exception as llm_error:
-                            yield _sse({
-                                "node": "analysis_error",
-                                "msg": str(llm_error)
-                            })
-
-                        yield _sse({"node": "analysis_end"})
-
-                    # ===============================
-                    # 2️⃣  其它普通节点
-                    # ===============================
-                    else:
-                        payload = {
-                            "node": node_name,
-                            "output": output or {}
-                        }
-                        yield _sse(payload)
-
-                    await asyncio.sleep(0)
-
-        except Exception as e:
-            yield _sse({
-                "node": "system_error",
-                "msg": str(e)
-            })
-
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache, no-transform",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        }
-    )
-def _sse(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-@router.get("/test-stream")
-async def test_stream():
-    async def generate():
-        for i in range(5):
-            yield f"data: ping {i}\n\n"
-            await asyncio.sleep(1) # 每秒发一次
-    return StreamingResponse(generate(), media_type="text/event-stream")
---- 文件结束: app/api/nl2analysis.py ---
-
-
-====================================================================
 文件: app/core/config.py
-大小: 1064 bytes
+大小: 1125 bytes
 ====================================================================
 
 '''
@@ -645,6 +253,7 @@ class Settings:
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
 
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
     BASE_URL: str = os.getenv("BASE_URL", "")
@@ -654,6 +263,7 @@ class Settings:
     EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
 
 settings = Settings()
+
 
 --- 文件结束: app/core/config.py ---
 
@@ -684,6 +294,53 @@ def build_db_url():
 engine = create_engine(build_db_url(), pool_pre_ping=True)
 
 --- 文件结束: app/core/db.py ---
+
+
+====================================================================
+文件: app/core/logger.py
+大小: 1082 bytes
+====================================================================
+
+# app/core/logger.py
+import logging
+from logging.handlers import RotatingFileHandler
+import sys
+
+def setup_logger():
+    logger = logging.getLogger("nl2analysis")
+    logger.setLevel(logging.DEBUG)  # 控制全局日志等级
+
+    # 控制台输出
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_format = logging.Formatter(
+        "[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    console_handler.setFormatter(console_format)
+    logger.addHandler(console_handler)
+
+    # 文件输出（可滚动）
+    file_handler = RotatingFileHandler(
+        "logs/nl2analysis.log", maxBytes=10*1024*1024, backupCount=5
+    )
+    file_handler.setLevel(logging.DEBUG)
+    
+    file_format = logging.Formatter(
+        "[%(asctime)s] "
+        "[%(levelname)s] "
+        "[%(name)s] "
+        "[%(filename)s:%(lineno)d] "
+        "%(message)s"
+        )
+    file_handler.setFormatter(file_format)
+    logger.addHandler(file_handler)
+
+    return logger
+
+logger = setup_logger()
+
+--- 文件结束: app/core/logger.py ---
 
 
 ====================================================================
@@ -772,6 +429,578 @@ def load_all_tables_schema() -> dict:
     return schema
 
 --- 文件结束: app/core/schema_loader.py ---
+
+
+====================================================================
+文件: app/graph/graph.py
+大小: 1337 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:15:10
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 13:44:38
+FilePath: /nl2analysis-agent/app/graph/graph.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/agent/graph.py
+
+from langgraph.graph import StateGraph
+from app.graph.state import GraphState
+from app.graph.nodes import (
+    pre_memory_node,
+
+    db_query_node,
+
+    post_memory_node,
+    nl2sql_prompt_node,
+    sql_llm_node,
+    analysis_prompt_node,
+    final_llm_node
+)
+
+graph = StateGraph(GraphState)
+
+graph.add_node("pre_memory", pre_memory_node)
+
+graph.add_node("nl2sql_prompt", nl2sql_prompt_node)
+graph.add_node("sql_llm", sql_llm_node)
+
+graph.add_node("db_query", db_query_node)
+
+graph.add_node("analysis_prompt", analysis_prompt_node)
+graph.add_node("final_llm", final_llm_node)
+
+graph.add_node("post_memory", post_memory_node)
+
+graph.set_entry_point("pre_memory")
+
+graph.add_edge("pre_memory", "nl2sql_prompt")
+graph.add_edge("nl2sql_prompt", "sql_llm")
+graph.add_edge("sql_llm", "db_query")
+graph.add_edge("db_query", "analysis_prompt")
+graph.add_edge("analysis_prompt", "final_llm")
+graph.add_edge("final_llm", "post_memory")
+
+
+app_graph = graph.compile()
+
+--- 文件结束: app/graph/graph.py ---
+
+
+====================================================================
+文件: app/graph/nodes/__init__.py
+大小: 983 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:41:44
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 13:44:52
+FilePath: /nl2analysis-agent/app/graph/nodes/__init__.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from .pre_memory_node import pre_memory_node
+from .nl2sql_node import nl2sql_node
+from .db_query_node import db_query_node
+from .analysis_node import analysis_node
+from .post_memory_node import post_memory_node
+from .nl2sql_prompt_node import nl2sql_prompt_node
+from .sql_llm_node import sql_llm_node
+from .analysis_prompt_node import analysis_prompt_node
+from .final_llm_node import final_llm_node
+__all__ = [
+    "pre_memory_node",
+    "nl2sql_node",
+    "db_query_node",
+    "analysis_node",
+    "post_memory_node",
+    "nl2sql_prompt_node",
+    "sql_llm_node",
+    "analysis_prompt_node",
+    "final_llm_node"
+]
+
+--- 文件结束: app/graph/nodes/__init__.py ---
+
+
+====================================================================
+文件: app/graph/nodes/analysis_node.py
+大小: 1478 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:06:54
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:21:59
+FilePath: /nl2analysis-agent/app/graph/nodes/analysis.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/graph/nodes/analysis.py
+
+from app.graph.state import GraphState
+import pandas as pd
+from app.llm.client import get_llm
+from app.memory.models import ChatMessage
+from app.core.logger import logger
+llm = get_llm()
+async def analysis_node(state: GraphState):
+    raw_data = state.get("raw_data")
+
+    if not raw_data:
+        state.setdefault("history", [])
+        state["history"].append(ChatMessage(
+    type="AIMessage",
+    content="未查询到数据"
+    
+))
+        return {"analysis": "未查询到数据。"}
+
+    df = pd.DataFrame(raw_data)
+    stats = df.describe(include="all").to_dict()
+
+    prompt = (
+        f"用户问题：{state['query']}\n"
+        f"统计信息：{stats}\n"
+        "请输出中文业务结论，并给出1-2条运营建议。"
+    )
+
+    result_text = await llm.ainvoke(prompt)
+    state.setdefault("history", [])
+    logger.info(f"{type(result_text)=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=result_text,
+    additional_kwargs=getattr(result_text, "additional_kwargs", {})
+))
+    return {
+        "analysis": result_text
+    }
+
+
+--- 文件结束: app/graph/nodes/analysis_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/analysis_prompt_node.py
+大小: 1151 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 13:41:57
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:07:52
+FilePath: /nl2analysis-agent/app/graph/nodes/analysis_prompt_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+import pandas as pd
+from  app.memory.models import ChatMessage
+from app.core.logger import logger
+async def analysis_prompt_node(state):
+    raw_data = state.get("raw_data")
+
+    if not raw_data:
+        return {"analysis_prompt": "未查询到数据。"}
+
+    df = pd.DataFrame(raw_data)
+    stats = df.describe(include="all").to_dict()
+
+    prompt = (
+        f"用户问题：{state['query']}\n"
+        f"统计信息：{stats}\n"
+        "请输出中文业务结论，并给出1-2条运营建议。"
+    )
+    state.setdefault("history", [])
+    logger.info(f"{type(prompt)=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=prompt,
+    additional_kwargs=getattr(prompt, "additional_kwargs", {})
+))
+    return {"analysis_prompt": prompt}
+
+--- 文件结束: app/graph/nodes/analysis_prompt_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/db_query_node.py
+大小: 1319 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:21:48
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:28:27
+FilePath: /nl2analysis-agent/app/graph/nodes/db_query_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+import asyncio
+from app.utils.db_tool import run_sql
+from app.core.logger import logger
+from app.memory.models import ChatMessage
+async def db_query_node(state):
+    try:
+        # 使用 run_in_executor 避免 SQL 查询阻塞事件循环
+        loop = asyncio.get_event_loop()
+        logger.info(f"state['sql']")
+        data = await loop.run_in_executor(None, run_sql, state["sql"])
+        if not data:
+            state.setdefault("history", [])
+            state["history"].append(ChatMessage(
+    type="AIMessage",
+    content="查询结果为空"
+))
+            return {"error": "查询结果为空", "raw_data": []}
+        state.setdefault("history", [])
+        logger.info(f"{type(data)=}")
+        state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=data,
+    additional_kwargs=getattr(data, "additional_kwargs", {})
+))
+        return {"raw_data": data}
+    except Exception as e:
+        return {"error": str(e)}
+--- 文件结束: app/graph/nodes/db_query_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/final_llm_node.py
+大小: 883 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 13:42:36
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:28:36
+FilePath: /nl2analysis-agent/app/graph/nodes/final_llm_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.llm.client import get_llm
+from app.memory.models import ChatMessage
+from app.core.logger import logger
+llm = get_llm()
+
+async def final_llm_node(state):
+    result = await llm.ainvoke(state["analysis_prompt"])
+    state.setdefault("history", [])
+    logger.info(f"{type(result)=}")
+    logger.info(f"{result=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=result.content,
+    additional_kwargs=getattr(result, "additional_kwargs", {})
+))
+    return {"analysis": result}
+
+--- 文件结束: app/graph/nodes/final_llm_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/nl2sql_node.py
+大小: 1577 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:19:59
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:28:45
+FilePath: /nl2analysis-agent/app/graph/nodes/nl2sql_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.llm.client import get_llm
+from app.core.schema_index import schema_index
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from app.utils.db_tool import extract_pure_sql
+from app.memory.models import ChatMessage
+from app.core.logger import logger
+llm = get_llm()
+async def nl2sql_node(state):
+    tables = schema_index.retrieve(state["query"], k=5)
+    tables_schema = "\n".join(tables)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "你是一个专业的 SQL 生成专家。请根据表结构生成 SELECT 语句。严禁 Markdown 标签。\n\n【表结构】\n{schema}"),
+        ("human", "{question}")
+    ])
+
+    sql_chain = prompt | llm | StrOutputParser()
+    # 使用 ainvoke 异步调用
+    raw_sql = await sql_chain.ainvoke({
+        "schema": tables_schema,
+        "question": state["query"]
+    })
+
+    clean_sql = extract_pure_sql(raw_sql)
+    state.setdefault("history", [])
+    logger.info(f"{type(clean_sql)=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=clean_sql,
+    additional_kwargs=getattr(clean_sql, "additional_kwargs", {})
+))
+    return {"sql": clean_sql}
+--- 文件结束: app/graph/nodes/nl2sql_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/nl2sql_prompt_node.py
+大小: 1145 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 13:41:07
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:28:54
+FilePath: /nl2analysis-agent/app/graph/nodes/nl2sql_prompt_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.core.schema_index import schema_index
+from app.memory.models import ChatMessage
+from app.core.logger import logger
+async def nl2sql_prompt_node(state):
+    tables = schema_index.retrieve(state["query"], k=5)
+    tables_schema = "\n".join(tables)
+
+    prompt = (
+        "你是一个专业的 SQL 生成专家。\n"
+        "请根据表结构生成 SELECT 语句。\n"
+        "严禁 Markdown 标签。\n\n"
+        f"【表结构】\n{tables_schema}\n\n"
+        f"【问题】{state['query']}"
+    )
+    state.setdefault("history", [])
+    logger.info(f"{type(prompt)=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=prompt,
+    additional_kwargs=getattr(prompt, "additional_kwargs", {})
+))
+    return {"sql_prompt": prompt}
+
+--- 文件结束: app/graph/nodes/nl2sql_prompt_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/post_memory_node.py
+大小: 2900 bytes
+====================================================================
+
+import asyncio
+import json
+from datetime import date, datetime
+from typing import Any, Dict
+
+from langchain_core.messages import AIMessage, HumanMessage
+
+from app.memory.backend import save_session
+from app.memory.models import SessionMemory, ChatMessage
+from app.core.logger import logger
+
+async def post_memory_node(state: Dict[str, Any]):
+    """
+    将 GraphState 保存到 Redis：
+    - 自动序列化 history 中的 AIMessage / HumanMessage / ChatMessage
+    - 自动序列化 date / datetime
+    - state['history'] 必须是消息列表，每条消息都会 append 到 history
+    """
+    loop = asyncio.get_event_loop()
+
+    def _serialize(obj):
+        if isinstance(obj, (date, datetime)):
+            return obj.isoformat()
+        if isinstance(obj, ChatMessage):
+            return obj.to_dict()
+        if isinstance(obj, (AIMessage, HumanMessage)):
+            # 转成 dict 形式
+            return {
+                "type": obj.type,
+                "content": obj.content,
+                "additional_kwargs": getattr(obj, "additional_kwargs", {})
+            }
+        raise TypeError(f"Type {type(obj)} not serializable")
+
+    def _save():
+        try:
+            user_id = state.get("user_id")
+            session_id = state.get("session_id")
+            if not user_id or not session_id:
+                raise ValueError("user_id or session_id missing in state")
+
+            # 确保 state['history'] 存在
+            history = state.setdefault("history", [])
+
+            # 把所有 LangChain 消息转换成 ChatMessage
+            messages = []
+            for m in history:
+                if isinstance(m, ChatMessage):
+                    messages.append(m)
+                elif isinstance(m, (AIMessage, HumanMessage)):
+                    messages.append(ChatMessage(
+                        type=m.type,
+                        content=m.content,
+                        additional_kwargs=getattr(m, "additional_kwargs", {})
+                    ))
+                elif isinstance(m, dict):
+                    # 兼容已经是 dict 的消息
+                    messages.append(ChatMessage.from_dict(m))
+                else:
+                    logger.warning(f"未知消息类型，忽略: {type(m)}")
+
+            # 构建 SessionMemory
+            session_memory = SessionMemory(
+                user_id=user_id,
+                session_id=session_id,
+                messages=messages
+            )
+
+            # JSON 序列化用于日志
+            json_str = json.dumps(session_memory.to_dict(), ensure_ascii=False, default=_serialize)
+            logger.info(f"[nl2analysis] serialized session_data: {json_str}")
+
+            # 保存到 Redis
+            save_session(session_memory)
+
+        except Exception as e:
+            logger.error(f"[post_memory_node] save_session error: {e}")
+
+    await loop.run_in_executor(None, _save)
+    return {}
+
+--- 文件结束: app/graph/nodes/post_memory_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/pre_memory_node.py
+大小: 693 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:17:07
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:19:46
+FilePath: /nl2analysis-agent/app/graph/nodes/pre_memory_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.memory.backend import load_session
+
+import asyncio
+
+async def pre_memory_node(state):
+    # 异步包装同步 IO
+    loop = asyncio.get_event_loop()
+    memory = await loop.run_in_executor(None, load_session, state["user_id"], state["session_id"])
+    return {"history": [m.__dict__ for m in memory.messages]}
+--- 文件结束: app/graph/nodes/pre_memory_node.py ---
+
+
+====================================================================
+文件: app/graph/nodes/sql_llm_node.py
+大小: 987 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 13:41:35
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 15:23:10
+FilePath: /nl2analysis-agent/app/graph/nodes/sql_llm_node.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.llm.client import get_llm
+from app.utils.db_tool import extract_pure_sql
+from app.memory.models import ChatMessage
+from app.core.logger import logger
+llm = get_llm()
+
+async def sql_llm_node(state):
+    raw_sql_msg = await llm.ainvoke(state["sql_prompt"])
+    raw_sql = raw_sql_msg.content  # 注意这里
+    clean_sql = extract_pure_sql(raw_sql)
+    state.setdefault("history", [])
+    logger.info(f"{type(clean_sql)=}")
+    state["history"].append(ChatMessage(
+    type="AIMessage",
+    content=clean_sql,
+    additional_kwargs=getattr(clean_sql, "additional_kwargs", {})
+))
+    return {"sql": clean_sql}
+
+--- 文件结束: app/graph/nodes/sql_llm_node.py ---
+
+
+====================================================================
+文件: app/graph/state.py
+大小: 632 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-14 02:17:48
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 13:43:13
+FilePath: /nl2analysis-agent/app/graph/state.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/graph/state.py
+
+from typing import TypedDict, List, Dict, Any, Optional
+
+
+class GraphState(TypedDict):
+    user_id: str
+    session_id: str
+    query: str
+    history: list
+    sql_prompt: str
+    sql: str
+    raw_data: list
+    analysis_prompt: str
+    analysis: str
+
+--- 文件结束: app/graph/state.py ---
+
+
+====================================================================
+文件: app/llm/base.py
+大小: 700 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:33:01
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:33:07
+FilePath: /nl2analysis-agent/app/llm/base.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from abc import ABC, abstractmethod
+from typing import AsyncGenerator
+
+
+class BaseLLMProvider(ABC):
+
+    @abstractmethod
+    async def astream(self, prompt: str) -> AsyncGenerator[str, None]:
+        """流式输出"""
+        pass
+
+    @abstractmethod
+    async def ainvoke(self, prompt: str) -> str:
+        """非流式调用"""
+        pass
+
+--- 文件结束: app/llm/base.py ---
 
 
 ====================================================================
@@ -870,8 +1099,210 @@ def get_llm(
 
 
 ====================================================================
+文件: app/llm/factory.py
+大小: 912 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:34:39
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:53:06
+FilePath: /nl2analysis-agent/app/llm/factory.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from app.llm.providers.openai_provider import OpenAIProvider
+from app.llm.providers.vllm_provider import VLLMProvider
+
+
+class LLMProviderFactory:
+
+    @staticmethod
+    def create(provider_name: str, config: dict):
+
+        if provider_name == "openai":
+            return OpenAIProvider(**config)
+
+        elif provider_name == "deepseek":
+            return DeepSeekProvider(**config)
+
+        elif provider_name == "vllm":
+            return VLLMProvider(**config)
+
+        else:
+            raise ValueError(f"Unknown LLM provider: {provider_name}")
+
+--- 文件结束: app/llm/factory.py ---
+
+
+====================================================================
+文件: app/llm/providers/__init__.py
+大小: 510 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:52:56
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:52:59
+FilePath: /nl2analysis-agent/app/llm/providers/__init__.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from .openai_provider import OpenAIProvider
+from .vllm_provider import VLLMProvider
+
+__all__ = [
+    "OpenAIProvider",
+    "VLLMProvider",
+]
+
+--- 文件结束: app/llm/providers/__init__.py ---
+
+
+====================================================================
+文件: app/llm/providers/openai_provider.py
+大小: 1316 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:33:31
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:33:48
+FilePath: /nl2analysis-agent/app/llm/providers/openai_provider.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+from openai import AsyncOpenAI
+from app.llm.base import BaseLLMProvider
+
+
+class OpenAIProvider(BaseLLMProvider):
+
+    def __init__(self, api_key: str, base_url: str, model: str):
+        self.client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url
+        )
+        self.model = model
+
+    async def astream(self, prompt: str):
+        stream = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+            stream=True,
+        )
+
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    async def ainvoke(self, prompt: str):
+        resp = await self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.choices[0].message.content
+
+--- 文件结束: app/llm/providers/openai_provider.py ---
+
+
+====================================================================
+文件: app/llm/providers/vllm_provider.py
+大小: 1157 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:34:04
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:34:13
+FilePath: /nl2analysis-agent/app/llm/providers/vllm_provider.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+import httpx
+from app.llm.base import BaseLLMProvider
+
+
+class VLLMProvider(BaseLLMProvider):
+
+    def __init__(self, base_url: str, model: str):
+        self.base_url = base_url
+        self.model = model
+
+    async def astream(self, prompt: str):
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream(
+                "POST",
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "stream": True
+                }
+            ) as resp:
+
+                async for line in resp.aiter_lines():
+                    if line.startswith("data: "):
+                        yield line[6:]
+
+--- 文件结束: app/llm/providers/vllm_provider.py ---
+
+
+====================================================================
+文件: app/llm/service.py
+大小: 1240 bytes
+====================================================================
+
+from app.core.config import settings
+from app.llm.factory import LLMProviderFactory
+
+
+class LLMService:
+
+    def __init__(self, tenant_id: str = "default"):
+        self.tenant_id = tenant_id
+        self.provider = self._load_provider()
+
+    def _load_provider(self):
+
+        # 默认租户
+        if self.tenant_id == "default":
+
+            provider = settings.LLM_PROVIDER
+            config = {
+                "api_key": settings.OPENAI_API_KEY,
+                "base_url": settings.BASE_URL,
+                "model": settings.LLM_MODEL,
+            }
+
+        # BI 租户
+        elif self.tenant_id == "tenant_bi":
+
+            provider = settings.TENANT_BI_PROVIDER
+            config = {
+                "api_key": settings.TENANT_BI_API_KEY,
+                "base_url": settings.TENANT_BI_BASE_URL,
+                "model": settings.TENANT_BI_MODEL,
+            }
+
+        else:
+            raise ValueError(f"Unknown tenant_id: {self.tenant_id}")
+
+        return LLMProviderFactory.create(provider, config)
+
+    async def astream(self, prompt: str):
+        async for token in self.provider.astream(prompt):
+            yield token
+
+    async def ainvoke(self, prompt: str):
+        return await self.provider.ainvoke(prompt)
+
+--- 文件结束: app/llm/service.py ---
+
+
+====================================================================
 文件: app/main.py
-大小: 274 bytes
+大小: 277 bytes
 ====================================================================
 
 '''
@@ -881,7 +1312,7 @@ FilePath: /alexqi/develop/nl2analysis-agent/app/main.py
 '''
 # app/main.py
 from fastapi import FastAPI
-from app.api.nl2analysis import router
+from app.router.nl2analysis import router
 
 app = FastAPI(title="NL2Analysis Agent")
 app.include_router(router)
@@ -891,7 +1322,7 @@ app.include_router(router)
 
 ====================================================================
 文件: app/memory/backend.py
-大小: 963 bytes
+大小: 971 bytes
 ====================================================================
 
 '''
@@ -903,6 +1334,7 @@ import json
 import redis
 from app.memory.models import ChatMessage, SessionMemory
 from app.core.config import settings
+from app.core.logger import logger
 
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
 
@@ -914,23 +1346,22 @@ def load_session(user_id, session_id) -> SessionMemory:
     if not raw:
         return SessionMemory(user_id=user_id, session_id=session_id)
     data = json.loads(raw)
-    return SessionMemory(
-        user_id=user_id,
-        session_id=session_id,
-        messages=[ChatMessage(**m) for m in data["messages"]]
-    )
+    return SessionMemory.from_dict(user_id, session_id, data)  # ✅ 使用 from_dict()
 
 def save_session(memory: SessionMemory):
-    r.set(key(memory.user_id, memory.session_id), json.dumps({
-        "messages": [m.__dict__ for m in memory.messages]
-    }), ex=86400)
+    logger.info(f"{memory=}")
+    r.set(
+        key(memory.user_id, memory.session_id),
+        json.dumps(memory.to_dict()),  # ✅ 使用 to_dict()
+        ex=86400
+    )
 
 --- 文件结束: app/memory/backend.py ---
 
 
 ====================================================================
 文件: app/memory/models.py
-大小: 391 bytes
+大小: 1310 bytes
 ====================================================================
 
 '''
@@ -938,25 +1369,236 @@ Author: qifuxiao 867225266@qq.com
 Date: 2026-02-14 02:17:08
 FilePath: /alexqi/develop/nl2analysis-agent/app/memory/models.py
 '''
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import List
-
+from datetime import date, datetime
 @dataclass
 class ChatMessage:
-    role: str
+    type: str  # "AIMessage" / "UserMessage"
     content: str
+    additional_kwargs: dict = field(default_factory=dict)
+    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
 
+    @staticmethod
+    def from_dict(data: dict):
+        return ChatMessage(
+            type=data.get("type", "AIMessage"),
+            content=data.get("content", ""),
+            additional_kwargs=data.get("additional_kwargs", {}),
+            timestamp=data.get("timestamp", datetime.now().isoformat())
+        )
+
+    def to_dict(self):
+        return asdict(self)
 @dataclass
 class SessionMemory:
     user_id: str
     session_id: str
     messages: List[ChatMessage] = field(default_factory=list)
+
+    def to_dict(self):
+        return {"messages": [m.to_dict() for m in self.messages]}
+
+    @staticmethod
+    def from_dict(user_id: str, session_id: str, data: dict):
+        messages = [ChatMessage.from_dict(m) for m in data.get("messages", [])]
+        return SessionMemory(user_id=user_id, session_id=session_id, messages=messages)
 --- 文件结束: app/memory/models.py ---
 
 
 ====================================================================
-文件: app/tools/db_tool.py
-大小: 1741 bytes
+文件: app/memory/serialize.py
+大小: 713 bytes
+====================================================================
+
+# app/memory/serialize.py
+from langchain.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+
+
+def serialize_object(obj):
+    """
+    递归安全序列化对象为 JSON 可存储形式
+    支持 AIMessage、HumanMessage、SystemMessage
+    """
+    if isinstance(obj, (AIMessage, HumanMessage, SystemMessage)):
+        return {
+            "type": obj.__class__.__name__,
+            "content": obj.content,
+            "additional_kwargs": getattr(obj, "additional_kwargs", {})
+        }
+    elif isinstance(obj, list):
+        return [serialize_object(i) for i in obj]
+    elif isinstance(obj, dict):
+        return {k: serialize_object(v) for k, v in obj.items()}
+    else:
+        return obj
+
+--- 文件结束: app/memory/serialize.py ---
+
+
+====================================================================
+文件: app/router/nl2analysis.py
+大小: 3293 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:09:17
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 07:51:47
+FilePath: /nl2analysis-agent/app/router/nl2analysis.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/router/nl2analysis.py
+
+from fastapi import APIRouter
+from fastapi.responses import StreamingResponse
+import asyncio
+from app.memory.backend import load_session, save_session
+from app.graph.graph import app_graph
+from app.llm.service import LLMService
+from app.utils.sse import sse_pack
+from app.schemas.query import QueryReq
+from app.core.logger import logger
+router = APIRouter()
+
+
+@router.post("/nl2analysis/stream")
+async def nl2analysis_stream(req: QueryReq):
+
+    async def event_generator():
+        # ⚡ 读取历史
+        session_mem = load_session(req.user_id, req.session_id)
+        from dataclasses import asdict
+
+        history = [asdict(m) for m in session_mem.messages]  # ✅ 或者 m.__dict__
+        
+        inputs = {
+            "query": req.query,
+            "user_id": req.user_id,
+            "session_id": req.session_id,
+            "history": history
+        }
+
+        llm_service = LLMService(tenant_id=req.tenant_id)
+
+        async for event in app_graph.astream(inputs, stream_mode="updates"):
+
+            for node_name, output in event.items():
+
+                # ===============================
+                # 这里开始接管 analysis streaming
+                # ===============================
+                try:
+                    if node_name == "analysis":
+
+                        prompt = output.get("analysis_prompt")
+
+                        if not prompt:
+                            logger.error(
+                                f"[Session {req.session_id}] analysis_prompt missing. Event: {output}"
+                            )
+                            yield sse_pack({
+                                "node": "analysis_error",
+                                "msg": "analysis_prompt missing"
+                            })
+                            continue
+
+                        # 👇👇👇 就写在这里
+                        yield sse_pack({"node": "analysis_start"})
+
+                        async for token in llm_service.astream(prompt):
+
+                            yield sse_pack({
+                                "node": "analysis_token",
+                                "content": token
+                            })
+
+                        yield sse_pack({"node": "analysis_end"})
+
+                    # 其他 graph 节点直接透传
+                    else:
+                        yield sse_pack({
+                            "node": node_name,
+                            "output": output
+                        })
+
+                    await asyncio.sleep(0)
+                except Exception as e:
+                    logger.exception(f"[Session {req.session_id}] Error processing node {node_name}")
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+        }
+    )
+
+
+--- 文件结束: app/router/nl2analysis.py ---
+
+
+====================================================================
+文件: app/schemas/query.py
+大小: 1248 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:28:32
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:28:39
+FilePath: /nl2analysis-agent/app/schemas/query.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/schemas/query.py
+
+from pydantic import BaseModel, Field
+from typing import Optional, Dict, Any
+
+
+class QueryReq(BaseModel):
+    """
+    NL2Analysis 请求模型
+    """
+
+    query: str = Field(
+        ...,
+        description="用户自然语言问题"
+    )
+
+    user_id: str = Field(
+        ...,
+        description="用户ID（可用于多租户模型选择）"
+    )
+
+    session_id: str = Field(
+        ...,
+        description="会话ID（用于会话级记忆或日志追踪）"
+    )
+
+    tenant_id: Optional[str] = Field(
+        default="default",
+        description="租户ID，用于选择不同LLM配置"
+    )
+
+    debug: Optional[bool] = Field(
+        default=False,
+        description="是否开启调试模式"
+    )
+
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="扩展字段，可用于透传前端参数"
+    )
+
+--- 文件结束: app/schemas/query.py ---
+
+
+====================================================================
+文件: app/utils/db_tool.py
+大小: 1976 bytes
 ====================================================================
 
 '''
@@ -969,6 +1611,7 @@ from sqlalchemy import create_engine, text
 from app.core.config import settings
 import math
 from fastapi.encoders import jsonable_encoder
+import re
 # 1. 动态构建数据库连接字符串
 # 格式: postgresql+psycopg2://user:password@host:port/dbname
 DATABASE_URL = (
@@ -989,7 +1632,12 @@ def run_sql(sql: str) -> list[dict]:
         result = conn.execute(text(sql))
         # 结果处理：将 RowMapping 对象转为标准的 dict 列表
         return [dict(row) for row in result.mappings()]
-
+def extract_pure_sql(text: str) -> str:
+    text = re.sub(r"```sql\n?", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"```\n?", "", text)
+    if ";" in text:
+        text = text.split(";")[0] + ";"
+    return text.strip()
 
 def clean_nans(obj):
     """递归将 NaN 和 Inf 转换为 None"""
@@ -1010,7 +1658,92 @@ if __name__ == "__main__":
         print("数据库连接测试成功:", test_res)
     except Exception as e:
         print("数据库连接失败:", str(e))
---- 文件结束: app/tools/db_tool.py ---
+--- 文件结束: app/utils/db_tool.py ---
+
+
+====================================================================
+文件: app/utils/json_utils.py
+大小: 1256 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:29:44
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:30:04
+FilePath: /nl2analysis-agent/app/utils/json_utils.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+# app/utils/json_utils.py
+
+import json
+import datetime
+import decimal
+import numpy as np
+from typing import Any
+
+
+def _default_serializer(obj: Any):
+    """
+    统一处理不可序列化对象
+    """
+
+    if isinstance(obj, (datetime.datetime, datetime.date)):
+        return obj.isoformat()
+
+    if isinstance(obj, decimal.Decimal):
+        return float(obj)
+
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+
+    if isinstance(obj, (np.floating,)):
+        return float(obj)
+
+    if isinstance(obj, (np.ndarray,)):
+        return obj.tolist()
+
+    return str(obj)
+
+
+def safe_json_dumps(data: Any) -> str:
+    """
+    企业级安全 JSON 序列化
+
+    - 兼容 numpy
+    - 兼容 datetime
+    - 支持中文
+    - 避免 NaN 报错
+    """
+
+    return json.dumps(
+        data,
+        default=_default_serializer,
+        ensure_ascii=False,
+        allow_nan=False
+    )
+
+--- 文件结束: app/utils/json_utils.py ---
+
+
+====================================================================
+文件: app/utils/sse.py
+大小: 490 bytes
+====================================================================
+
+'''
+Author: qifuxiao 867225266@qq.com
+Date: 2026-02-17 02:30:20
+LastEditors: qifuxiao 867225266@qq.com
+LastEditTime: 2026-02-17 02:30:23
+FilePath: /nl2analysis-agent/app/utils/sse.py
+Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
+'''
+def sse_pack(data: dict) -> str:
+    from app.utils.json_utils import safe_json_dumps
+    return f"data: {safe_json_dumps(data)}\n\n"
+
+--- 文件结束: app/utils/sse.py ---
 
 
 ====================================================================
@@ -1442,7 +2175,7 @@ volumes:
 
 ====================================================================
 文件: pyproject.toml
-大小: 733 bytes
+大小: 765 bytes
 ====================================================================
 
 [project]
@@ -1467,6 +2200,7 @@ dependencies = [
     "uvicorn (>=0.40.0,<0.41.0)",
     "psycopg2-binary (>=2.9.11,<3.0.0)",
     "faiss-cpu (>=1.13.2,<2.0.0)",
+    "locust (>=2.43.3,<3.0.0)",
 ]
 
 
@@ -1479,7 +2213,7 @@ build-backend = "poetry.core.masonry.api"
 
 ====================================================================
 文件: python_code.txt
-大小: 42571 bytes
+大小: 66660 bytes
 ====================================================================
 
 [无法读取文件内容]
@@ -1573,10 +2307,43 @@ except Exception as e:
 --- 文件结束: test_connection.py ---
 
 
+====================================================================
+文件: tests/locustfile.py
+大小: 764 bytes
+====================================================================
+
+from locust import HttpUser, task, between
+import uuid
+
+class NL2AnalysisUser(HttpUser):
+    wait_time = between(1, 2)
+
+    @task
+    def stream_query(self):
+        # 每个虚拟用户生成唯一 session
+        user_id = f"user_{uuid.uuid4().hex[:8]}"
+        session_id = uuid.uuid4().hex
+
+        payload = {
+            "query": "查询学生专业分布",
+            "user_id": user_id,
+            "session_id": session_id
+        }
+
+        with self.client.post("/nl2analysis/stream", json=payload, stream=True, catch_response=True) as response:
+            for line in response.iter_lines():
+                if line:
+                    # 可以打印或统计每行流式数据
+                    print(line.decode())
+            response.success()
+
+--- 文件结束: tests/locustfile.py ---
+
+
 ========================================
   收集完成统计
 ========================================
-总文件数: 29
+总文件数: 47
 输出文件: /home/alexqi/develop/nl2analysis-agent/python_code.txt
-生成时间: Tue Feb 17 02:00:43 UTC 2026
+生成时间: Wed Feb 18 00:04:05 UTC 2026
 ========================================

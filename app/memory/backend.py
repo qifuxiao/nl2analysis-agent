@@ -7,6 +7,7 @@ import json
 import redis
 from app.memory.models import ChatMessage, SessionMemory
 from app.core.config import settings
+from app.core.logger import logger
 
 r = redis.Redis(host=settings.REDIS_HOST, port=settings.REDIS_PORT, decode_responses=True)
 
@@ -18,13 +19,12 @@ def load_session(user_id, session_id) -> SessionMemory:
     if not raw:
         return SessionMemory(user_id=user_id, session_id=session_id)
     data = json.loads(raw)
-    return SessionMemory(
-        user_id=user_id,
-        session_id=session_id,
-        messages=[ChatMessage(**m) for m in data["messages"]]
-    )
+    return SessionMemory.from_dict(user_id, session_id, data)  # ✅ 使用 from_dict()
 
 def save_session(memory: SessionMemory):
-    r.set(key(memory.user_id, memory.session_id), json.dumps({
-        "messages": [m.__dict__ for m in memory.messages]
-    }), ex=86400)
+    logger.info(f"{memory=}")
+    r.set(
+        key(memory.user_id, memory.session_id),
+        json.dumps(memory.to_dict()),  # ✅ 使用 to_dict()
+        ex=86400
+    )
