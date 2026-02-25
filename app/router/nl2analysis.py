@@ -1,8 +1,8 @@
 '''
 Author: qifuxiao 867225266@qq.com
 Date: 2026-02-17 02:09:17
-LastEditors: qifuxiao 867225266@qq.com
-LastEditTime: 2026-02-18 00:49:54
+LastEditors: Please set LastEditors
+LastEditTime: 2026-02-25 07:54:43
 FilePath: /nl2analysis-agent/app/router/nl2analysis.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -38,19 +38,26 @@ async def nl2analysis_stream(req: QueryReq):
             "session_id": req.session_id,
             "history": history
         }
-
+        logger.info(f"🎯 Graph inputs: {inputs.keys()}")
+        logger.debug(f"📦 Full inputs: {inputs}")  # 注意：history 较长时慎用 debug
         llm_service = LLMService(tenant_id=req.tenant_id)
 
         async for event in app_graph.astream(inputs, stream_mode="updates"):
-
+            # 🔥 调试：打印事件结构
+            logger.info(f"🔄 Received event type: {type(event)}")
+            logger.info(f"🔄 Event keys: {list(event.keys()) if isinstance(event, dict) else 'NOT DICT'}")
             for node_name, output in event.items():
-
+                # 🔥 调试：每个节点的输出
+                logger.info(f"📦 Node [{node_name}] output type: {type(output)}")
+                logger.info(f"📦 Node [{node_name}] output value: {output}")
                 try:
                     # ===============================
                     # 🔥 接管 analysis_prompt 流式输出
                     # ===============================
                     if node_name == "analysis_prompt":
-
+                         # 🔥 调试：确认 output 内容
+                        logger.info(f"🔍 analysis_prompt output: {output}")
+                        logger.info(f"🔍 output.get('analysis_prompt') type: {type(output.get('analysis_prompt'))}")
                         prompt = output.get("analysis_prompt")
 
                         if not prompt:
