@@ -11,13 +11,7 @@ load_dotenv()
 
 @dataclass
 class Settings:
-    DB_TYPE: str = os.getenv("DB_TYPE", "postgres")
-    DB_HOST: str = os.getenv("DB_HOST", "localhost")
-    DB_PORT: int = int(os.getenv("DB_PORT", "5432"))
-    DB_NAME: str = os.getenv("DB_NAME", "demo")
-    DB_USER: str = os.getenv("DB_USER", "demo")
-    DB_PASSWORD: str = os.getenv("DB_PASSWORD", "demo")
-
+    
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))
 
@@ -25,10 +19,11 @@ class Settings:
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1-mini")
     BASE_URL: str = os.getenv("BASE_URL", "")
-
+    SSO_APP_ID: str = os.getenv("SSO_APP_ID", "")
+    SSO_SECRET_KEY: str = os.getenv("SSO_SECRET_KEY", "")
+    API_DOMAIN: str = os.getenv("API_DOMAIN", "https://192.168.101.54:8888")
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
     EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "")
     EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "")
 
 settings = Settings()
-

@@ -2,14 +2,12 @@
 Author: qifuxiao 867225266@qq.com
 Date: 2026-02-17 13:41:07
 LastEditors: Please set LastEditors
-LastEditTime: 2026-02-25 08:05:09
+LastEditTime: 2026-02-25 09:16:28
 FilePath: /nl2analysis-agent/app/graph/nodes/time_prompt.py
 Description: 时间参数提取节点：从 query 中解析 gid/start_time/end_time
 '''
 import json
 import re
-from app.core.schema_index import schema_index
-from app.memory.models import ChatMessage
 from app.core.logger import logger
 from app.llm.service import LLMService  # 🔥 引入 LLM 服务
 
@@ -35,10 +33,7 @@ async def time_prompt_node(state):
                 "time_prompt": "用户未提供查询内容"
             }
 
-        # 🔥 2. （可选）检索相关表结构，增强提取准确性
-        tables = schema_index.retrieve(query, k=3)
-        tables_schema = "\n".join(str(t) for t in (tables or [])) if tables else "无相关表结构"
-        logger.debug(f"📦 Retrieved {len(tables or [])} tables")
+        
 
         # 🔥 3. 构造提取 prompt（要求 JSON 输出）
         extract_prompt = (
@@ -54,7 +49,7 @@ async def time_prompt_node(state):
             "3. 严禁输出 Markdown、解释文字或其他内容，只输出 JSON\n"
             "4. gid 通常是数字字符串，如 '4715'\n\n"
             f"【用户问题】{query}\n"
-            f"【参考表结构】{tables_schema}"
+            
         )
 
         # 🔥 4. 调用大模型提取（同步 invoke，避免流式复杂性）
