@@ -9,8 +9,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 🔥 辅助函数：将字符串转换为布尔值
+def _str_to_bool(value: str, default: bool) -> bool:
+    """转换环境变量字符串为 bool: 'true'/'1'/'yes' → True"""
+    if value is None:
+        return default
+    return str(value).lower().strip() in ("true", "1", "yes", "on")
+
 @dataclass
 class Settings:
+    
+    # 🔥 新增：Redis 开关（默认 True，生产环境启用）
+    USE_REDIS: bool = _str_to_bool(os.getenv("USE_REDIS"), True)
     
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", "6379"))

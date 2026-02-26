@@ -2,7 +2,7 @@
 Author: qifuxiao 867225266@qq.com
 Date: 2026-02-14 02:17:48
 LastEditors: Please set LastEditors
-LastEditTime: 2026-02-25 08:19:43
+LastEditTime: 2026-02-26 11:12:44
 FilePath: /nl2analysis-agent/app/graph/state.py
 Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 '''
@@ -23,3 +23,11 @@ class GraphState(TypedDict):
     alert_rule_status: Optional[str]
     history: List[Dict[str, Any]]  # 用于存储对话历史等信息
     analysis_prompt: Optional[str]  # 存储分析提示词
+
+    attack_features: Optional[Dict[str, Any]]
+    risk_assessment: Optional[Dict[str, Any]]
+    analysis_text: Optional[str]
+    
+    # 🔹 错误处理（可选）
+    error: Optional[str]
+    error_details: Optional[Dict[str, Any]]

@@ -9,6 +9,8 @@ from datetime import datetime
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 
+from app.core.logger import logger
+
 # 导入你的 GraphState，根据实际路径调整
 from app.graph.state import GraphState
 
@@ -27,7 +29,7 @@ def send_post_request(url: str, payload: dict, headers: Optional[Dict] = None) -
             json=payload,
             headers=headers,
             timeout=50,
-            verify=False  # ⚠️ 生产环境请配置有效SSL证书
+            verify=False  
         )
         print('***************')
         print(response.text)
@@ -85,8 +87,61 @@ def _normalize_time(time_str: Optional[str], is_end: bool = False) -> str:
             continue
     # 解析失败时返回默认值
     return _normalize_time(None, is_end)
+def build_attack_features(df: pd.DataFrame) -> dict:
+    total = int(df["threat_count"].sum())
 
+    source_stats = (
+        df.groupby("event_source_ip")["threat_count"]
+        .sum()
+        .sort_values(ascending=False)
+    )
 
+    destination_stats = (
+        df.groupby("event_destination_ip")["threat_count"]
+        .sum()
+        .sort_values(ascending=False)
+    )
+
+    return {
+        "total_events": total,
+        "unique_source_ip": int(df["event_source_ip"].nunique()),
+        "unique_destination_ip": int(df["event_destination_ip"].nunique()),
+        "top_source_ip": source_stats.head(5).to_dict(),
+        "top_destination_ip": destination_stats.head(5).to_dict(),
+        "is_single_source_attack": source_stats.iloc[0] / total > 0.6,
+        "is_multi_target_attack": len(destination_stats) > 3,
+    }
+def calculate_risk_score(features: dict) -> dict:
+    score = 0
+
+    if features["total_events"] > 100:
+        score += 30
+
+    if features["is_single_source_attack"]:
+        score += 25
+
+    if features["is_multi_target_attack"]:
+        score += 25
+
+    if features["unique_source_ip"] > 5:
+        score += 20
+
+    level = "低"
+    if score >= 70:
+        level = "高"
+    elif score >= 40:
+        level = "中"
+
+    return {
+        "risk_score": score,
+        "risk_level": level
+    }
+MITRE_TACTIC_SEVERITY = {
+    "Credential Access": 30,
+    "Lateral Movement": 40,
+    "Persistence": 35,
+    "Privilege Escalation": 45,
+}
 def _query_alert_rule_api(gid: Optional[str], start_time: str, end_time: str) -> Any:
     """执行实际的API查询逻辑（纯函数，便于测试）"""
     table_name = "alarm_result"
@@ -103,8 +158,9 @@ def _query_alert_rule_api(gid: Optional[str], start_time: str, end_time: str) ->
         "pageNo": 1,
         "pageSize": 500
     }
-
+    logger.info(f"请求URL: {url}")
     response = send_post_request(url, payload)
+    logger.info(f"请求响应: {response}")
     if response:
         out = response.json()
         return data_group(out)
@@ -112,37 +168,38 @@ def _query_alert_rule_api(gid: Optional[str], start_time: str, end_time: str) ->
         return {"error": "告警查询失败", "query_params": {"gid": gid, "start_time": start_time, "end_time": end_time}}
 
 
-# ============ 🔑 LangGraph 节点入口函数 ============
+# ============ LangGraph 节点入口函数 ============
 def alert_rule_node(state: GraphState) -> Dict[str, Any]:
     """
     LangGraph 节点：查询告警规则结果
     
-    📥 从 state 读取:
+    从 state 读取:
     - gid / alert_gid: 客户唯一标识 (可选)
     - start_time / alert_start_time: 开始时间 (可选)
     - end_time / alert_end_time: 结束时间 (可选)
     
-    📤 返回更新到 state:
+     返回更新到 state:
     - alert_rule_data: 查询结果
     - alert_rule_query_params: 实际查询参数(便于调试)
     - alert_rule_status: "success" | "failed"
     """
-    # 1️⃣ 从 state 提取参数（支持多种键名兼容）
+    #  从 state 提取参数（支持多种键名兼容）
     gid = state.get("gid") or state.get("alert_gid")
     start_time = state.get("start_time") or state.get("alert_start_time")
     end_time = state.get("end_time") or state.get("alert_end_time")
     
-    # 2️⃣ 参数预处理
+    #  参数预处理
     start_norm = _normalize_time(start_time, is_end=False)
     end_norm = _normalize_time(end_time, is_end=True)
     
     print(f"[alert_rule_node] 执行: gid={gid}, {start_norm} → {end_norm}")
     
     try:
-        # 3️⃣ 执行查询
+        # 执行查询
         result = _query_alert_rule_api(gid, start_norm, end_norm)
-        
-        # 4️⃣ 返回 state 更新内容
+        logger.info(f"alert_rule_node 查询成功 | 结果条数: {len(result) if isinstance(result, list) else 'N/A'}")
+        logger.info(f"查询结果: result={result}")
+        # 返回 state 更新内容
         return {
             "alert_rule_data": result,
             "alert_rule_query_params": {
@@ -159,7 +216,7 @@ def alert_rule_node(state: GraphState) -> Dict[str, Any]:
         }
 
 
-# ============ 🔁 兼容原有调用方式（非Graph场景） ============
+# ============ 兼容原有调用方式（非Graph场景） ============
 def alert_rule_request(
     gid: Optional[str] = None,
     start_time: Optional[str] = None,
