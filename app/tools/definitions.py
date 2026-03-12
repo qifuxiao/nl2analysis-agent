@@ -5,10 +5,10 @@ This module defines the tools available to each agent using LangChain's @tool de
 """
 import json
 import logging
+import httpx
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from langchain_core.tools import tool
-from langchain_community.utilities import BraveSearchWrapper, TavilySearchAPI
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
@@ -172,26 +172,38 @@ def web_search(query: str, max_results: int = 5) -> str:
                 }
                 for r in results.get("results", [])
             ], ensure_ascii=False)
+        except ImportError:
+            logger.warning("tavily package not installed")
         except Exception as e:
             logger.warning(f"Tavily search failed: {e}")
     
-    # Fallback to Brave Search
+    # Fallback to Brave Search via API
     if settings.BRAVE_API_KEY:
         try:
-            wrapper = BraveSearchWrapper(api_key=settings.BRAVE_API_KEY)
-            results = wrapper.results(query, max_results=max_results)
-            return json.dumps([
-                {
-                    "title": r.get("title"),
-                    "url": r.get("link"),
-                    "content": r.get("snippet", ""),
-                }
-                for r in results
-            ], ensure_ascii=False)
+            async def brave_search():
+                headers = {"Accept": "application/json", "X-Subscription-Token": settings.BRAVE_API_KEY}
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"https://api.search.brave.com/res/v1/web/search?q={query}&count={max_results}",
+                        headers=headers
+                    )
+                    data = resp.json()
+                    return [
+                        {
+                            "title": r.get("title"),
+                            "url": r.get("url"),
+                            "content": r.get("description", ""),
+                        }
+                        for r in data.get("web", {}).get("results", [])
+                    ]
+            
+            import asyncio
+            results = asyncio.run(brave_search())
+            return json.dumps(results, ensure_ascii=False)
         except Exception as e:
             logger.warning(f"Brave search failed: {e}")
     
-    return json.dumps({"error": "No search API configured"})
+    return json.dumps({"error": "No search API configured. Set TAVILY_API_KEY or BRAVE_API_KEY in environment."})
 
 
 # ============================================================================
