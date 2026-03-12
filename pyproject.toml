@@ -8,13 +8,10 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    # LangChain & LangGraph (latest versions)
+    # LangChain & LangGraph
     "langchain>=0.3.0",
     "langgraph>=0.2.0",
     "langchain-core>=0.3.0",
-    "langchain-community>=0.3.0",
-    "langchain-openai>=0.2.0",
-    "langchain-anthropic>=0.2.0",
     
     # FastAPI & Server
     "fastapi>=0.115.0",
@@ -31,9 +28,9 @@ dependencies = [
     "numpy>=1.26.0",
     "plotly>=6.0.0",
     
-    # Web Search
-    "brave-search>=1.0.0",
-    "tavily>=1.0.0",
+    # Web Search (optional)
+    # "brave-search>=0.1.0",
+    # "tavily-python>=0.3.0",
     
     # File Processing
     "python-magic>=0.4.27",
