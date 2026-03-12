@@ -68,6 +68,9 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["app"]
 
+[tool.poetry]
+package-mode = false
+
 [tool.ruff]
 target-version = "py311"
 line-length = 100
